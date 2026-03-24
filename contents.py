@@ -1,0 +1,1353 @@
+from shared.tools.logging import Logger; Logger().trace('Compiling module')
+
+from shared.data.types.enum import Enum
+from shared.tools.global import ExtraGlobal
+
+from eurosort.context import EuroSorterContextManagement
+from eurosort.destmap import EuroSorterDestinationMapping
+from eurosort.routing import EuroSorterRoutingManagement
+from eurosort.sorterdata.destination import SorterDataDestination_DefaultPattern
+
+from datetime import datetime
+
+from database.mongodb.records import select_record, upsert_record
+
+import json, os
+import system
+import copy
+
+
+MONGODB    = 'MongoWCS'
+MONGO_COLL = 'eurosort_data'
+
+
+# ---------------------------------------------------------------------------
+# Shared chute schema for all sorters
+# ---------------------------------------------------------------------------
+
+COMMON_CHUTE_DEFAULT = {
+	'_id': None,                     # DST-XXXX-X-X-A/B
+	'destination': '',               # same as _id
+	'chuteName': '',                 # WCS chute name
+	'sorter': '',
+
+	# common chute configuration / state
+	'faulted': False,
+	'in_service': True,
+	'position': None,                # FRONT | REAR | None
+	'chute_type': 'NORMAL',          # NORMAL | PACKOUT | HP | JACKPOT | INSPECTION | NOREAD | BAGGING
+	'lane': 0,
+	'occupied': False,
+	'available': True,
+	'dfs': False,
+	'ofs': False,
+	'first_item_delivered_ts': None,
+
+
+	# sorter-specific payload lives here
+	'chute_info': {},
+
+	# common tracking / metrics
+	'enroute': 0,
+	'enqueue': 0,
+	'delivered': 0,
+	'last_updated': None,
+}
+
+
+# ---------------------------------------------------------------------------
+# Per-sorter chute_info defaults
+# ---------------------------------------------------------------------------
+
+LEVEL2_CHUTE_DEFAULT = {
+	'building_id': None,
+	'ibns': '',
+	'oversized': False,
+	'undersized': False,
+	'shape': None,
+	'inspection': False,
+	'size_mode': None,
+	'assigned': False,
+	'assigned_name': '',
+	'assigned_mode': '',
+	'has_upper_lower': True,
+	'has_front_rear': False,
+	'has_gate': True,
+
+	'transit_info': {},
+}
+
+LEVEL3_CHUTE_DEFAULT = {
+	'chuteCount': 0,
+	'wcs_processed': True,
+	'toteFull': False,
+	'queued': False,
+	'volume_percent_full': 0.0,
+	'waiting_for_processing': False,
+	'ibns': '',
+	'volume': 0.0,
+	'group_id': '',
+	'zone': '',
+	'chuteFull': False,
+	'has_upper_lower': True,
+	'has_front_rear': True,
+	'has_gate': False,
+
+}
+
+LEVEL3_SHIP_CHUTE_DEFAULT = {
+	'ready_for_packout': False,
+	'missing_ibns': [],
+	'expected_line_count': 0,
+	'order_count_total': 0,
+	'item_count_total': 0,
+	'line_count_total': 0,
+	'percent_orders_consolidated': 0.0,
+	'oldest_order_age_sec': 0,
+	'batch_door_state': 'DOWN',      # UP | DOWN | UNKNOWN
+	'orders': [],
+	'ibns': [],
+	'has_upper_lower': True,
+	'has_front_rear': True,
+	'has_gate': True,
+
+}
+
+
+SORTER_CONFIG = {
+	'Level2': {
+		'aliases': ('Level2', 'level2', 'LEVEL2'),
+		'carrier_max': 772,
+		'wcs_prefix': 'B',
+		'mode': 'level2',
+		'chute_default': LEVEL2_CHUTE_DEFAULT,
+		'tag_field_map': {
+			'in_service':    'in_service',
+			'faulted':       'faulted',
+			'chute_type':    'chute_type',
+			'lane':          'lane',
+			'occupied':      'occupied',
+			'available':     'available',
+			'dfs':           'dfs',
+			'ofs':           'ofs',
+			'assigned':      'assigned',
+			'assigned_mode': 'assigned_mode',
+			'assigned_name': 'assigned_name',
+			'oversized':     'oversized',
+			'size_mode':     'size_mode',
+			'enroute':       'enroute',
+			'enqueue':       'enqueue',
+			'delivered':     'delivered',
+		},
+	},
+	'Level3': {
+		'aliases': ('Level3', 'level3', 'LEVEL3'),
+		'carrier_max': 499,
+		'wcs_prefix': 'C',
+		'mode': 'level3',
+		'chute_default': LEVEL3_CHUTE_DEFAULT,
+		'tag_field_map': {
+			'in_service':             'in_service',
+			'faulted':                'faulted',
+			'chute_type':             'chute_type',
+			'lane':                   'lane',
+			'occupied':               'occupied',
+			'available':              'available',
+			'dfs':                    'dfs',
+			'ofs':                    'ofs',
+			'zone':                   'zone',
+			'group_id':               'group_ID',
+			'ibns':                   'ibns',
+			'queued':                 'queued',
+			'chuteFull':              'chuteFull',
+			'toteFull':               'toteFull',
+			'wcs_processed':          'wcs_processed',
+			'waiting_for_processing': 'waiting_for_processing',
+			'volume':                 'volume',
+			'volume_percent_full':    'volume_percent_full',
+			'chuteCount':             'chuteCount',
+			'enroute':                'enroute',
+			'enqueue':                'enqueue',
+			'delivered':              'delivered',
+		},
+	},
+	'Level3_Ship': {
+		'aliases': ('Level3_Ship', 'level3_ship', 'LEVEL3_SHIP', 'Level3Ship', 'level3ship'),
+		'carrier_max': 999,
+		'wcs_prefix': 'D',
+		'mode': 'level3_ship',
+		'chute_default': LEVEL3_SHIP_CHUTE_DEFAULT,
+		'tag_field_map': {
+			'in_service':                  'in_service',
+			'faulted':                     'faulted',
+			'chute_type':                  'chute_type',
+			'lane':                        'lane',
+			'occupied':                    'occupied',
+			'available':                   'available',
+			'dfs':                         'dfs',
+			'ofs':                         'ofs',
+			'first_item_delivered_ts':     'first_item_delivered_ts',
+			'ready_for_packout':           'ready_for_packout',
+			'missing_ibns':                'missing_ibns',
+			'expected_line_count':         'expected_line_count',
+			'order_count_total':           'order_count_total',
+			'item_count_total':            'item_count_total',
+			'line_count_total':            'line_count_total',
+			'percent_orders_consolidated': 'percent_orders_consolidated',
+			'oldest_order_age_sec':        'oldest_order_age_sec',
+			'batch_door_state':            'batch_door_state',
+			'orders':                      'orders',
+			'ibns':                        'ibns',
+			'enroute':                     'enroute',
+			'enqueue':                     'enqueue',
+			'delivered':                   'delivered',
+		},
+	},
+}
+
+
+class Chutes(Enum):
+	LOWER = '1'
+	UPPER = '2'
+
+
+class Dests(Enum):
+	REAR = '1'
+	FRONT = '2'
+
+
+class Sides(Enum):
+	A = 'A'
+	B = 'B'
+
+
+class Destination(object):
+	"""Normalizes and coerces to a standard pattern."""
+	__slots__ = ['_station', '_chute', '_side', '_dest', '_context']
+	LOOKUP_PROPERTIES = ['station', 'chute', 'dest', 'side']
+
+	def __init__(self, station, chute, dest=None, side=None, **context):
+		# allow 3-arg calling style: (station, chute, side)
+		if side is None and dest is not None:
+			side = dest
+			dest = None
+
+		if dest is None:
+			dest = Dests.REAR
+
+		self._station = self._coerce_station(station)
+		self._chute   = self._coerce_chute(chute)
+		self._dest    = self._coerce_dest(dest)
+		self._side    = self._coerce_side(side)
+		self._context = context
+
+	@property
+	def station(self): return self._station
+
+	@property
+	def chute(self): return self._chute
+
+	@property
+	def side(self): return self._side
+
+	@property
+	def dest(self): return self._dest
+
+	@property
+	def destination(self): return str(self)
+
+	@classmethod
+	def _coerce_station(cls, station):
+		return '%04d' % int(station)
+
+	@classmethod
+	def _coerce_chute(cls, chute):
+		if isinstance(chute, Chutes):
+			return chute
+		s = str(chute).strip().upper()
+		if s in ('LOWER', 'BOTTOM'):
+			return Chutes.LOWER
+		if s in ('UPPER', 'TOP'):
+			return Chutes.UPPER
+		return Chutes(str(int(s)))
+
+	@classmethod
+	def _coerce_side(cls, side):
+		if isinstance(side, Sides):
+			return side
+		s = str(side).strip().upper()
+		return Sides(s)
+
+	@classmethod
+	def _coerce_dest(cls, dest):
+		if isinstance(dest, Dests):
+			return dest
+		s = str(dest).strip()
+		try:
+			return Dests(s)
+		except Exception:
+			return s
+
+	@classmethod
+	def parse(cls, destination):
+		if isinstance(destination, cls):
+			return destination
+
+		if isinstance(destination, dict) and 'destination' in destination:
+			return cls.parse(destination['destination'])
+
+		if not isinstance(destination, (str, unicode)):
+			return cls.parse(str(destination))
+
+		s = destination.strip()
+
+		# Accept BOTH:
+		#  - DST-0001-1-1-A
+		#  - DST-0001-1-A  (defaults dest -> '1')
+		parts = s.split('-')
+		if len(parts) == 4 and parts[0].upper() == 'DST':
+			_, station, chute, side = parts
+			return cls(station, chute, Dests.REAR, side)
+
+		match = SorterDataDestination_DefaultPattern.DESTINATION_PATTERN.match(s)
+		if not match:
+			raise KeyError('%r does not match the pattern expected; can not parse' % destination)
+
+		mgd = match.groupdict()
+		return cls(mgd['station'], mgd['chute'], mgd['dest'], mgd['side'])
+
+	def __getitem__(self, key):
+		assert key in self.LOOKUP_PROPERTIES, "Only station, chute, dest, and side are available for lookup"
+		return getattr(self, key)
+
+	def __iter__(self):
+		for key in self.LOOKUP_PROPERTIES:
+			yield key
+
+	def __hash__(self):
+		return hash(str(self))
+
+	def __eq__(self, other):
+		return str(self) == str(other)
+
+	def __lt__(self, other):
+		return str(self) < str(other)
+
+	def __str__(self):
+		return 'DST-%s-%s-%s-%s' % (self._station, self._chute, self._dest, self._side)
+
+	def __repr__(self):
+		return str(self)
+
+
+class EuroSorterContentTracking(
+	EuroSorterRoutingManagement,
+	EuroSorterContextManagement,
+	EuroSorterDestinationMapping,
+):
+	DESTINATION_CONTENT_CACHE_SCOPE = 'EuroSort-Contents'
+
+	CARRIERS_CACHE_SCOPE = 'EuroSort-Carriers'
+	CARRIERS_LIFESPAN_SEC = 60 * 60 * 24   # one day
+
+	_SIDE_TOKENS = set([m for m in Sides])
+
+	def __init__(self, name, **init_config):
+		name = self._normalize_sorter_name(name)
+		super(EuroSorterContentTracking, self).__init__(name, **init_config)
+		self._initialize_destination_contents()
+		self._initialize_carrier_contents()
+
+	# ------------------------------------------------------------------
+	# SORTER CONFIG
+	# ------------------------------------------------------------------
+	def _normalize_sorter_name(self, name):
+		s = str(name).strip()
+		for canonical_name, cfg in SORTER_CONFIG.items():
+			for alias in cfg.get('aliases', ()):
+				if s == alias:
+					return canonical_name
+		return s
+
+	def _get_sorter_config(self):
+		cfg = SORTER_CONFIG.get(self.name)
+		if not cfg:
+			raise ValueError('Sorter %s is not configured in SORTER_CONFIG' % self.name)
+		return cfg
+
+	def _get_sorter_mode(self):
+		return self._get_sorter_config().get('mode')
+
+	def _clone(self, value):
+		try:
+			return copy.deepcopy(value)
+		except Exception:
+			try:
+				return json.loads(json.dumps(value, default=repr))
+			except Exception:
+				return value
+
+	def _get_position_from_destination(self, dest_string):
+		try:
+			d = Destination.parse(dest_string)
+			if str(d.dest) == '1':
+				return 'REAR'
+			elif str(d.dest) == '2':
+				return 'FRONT'
+		except Exception:
+			pass
+		return None
+
+	def _flatten_destination_record_for_tags(self, record):
+		flat = {}
+		if not isinstance(record, dict):
+			return flat
+
+		for k, v in record.items():
+			if k == 'chute_info':
+				continue
+			flat[k] = v
+
+		chute_info = record.get('chute_info') or {}
+		if isinstance(chute_info, dict):
+			for k, v in chute_info.items():
+				flat[k] = v
+
+		return flat
+
+	def _apply_physical_behavior_defaults(self, new_record):
+		chute_type = str(new_record.get('chute_type', 'NORMAL')).strip().upper()
+
+		if chute_type == 'BAGGING':
+			new_record['has_upper_lower'] = False
+			new_record['has_front_rear'] = False
+			new_record['has_gate'] = False
+		else:
+			new_record['has_upper_lower'] = True
+			new_record['has_front_rear'] = True
+			new_record['has_gate'] = True
+
+		return new_record
+
+	# ------------------------------------------------------------------
+	# CONFIG LOAD
+	# ------------------------------------------------------------------
+	def _load_routing_config(self):
+		super(EuroSorterContentTracking, self)._load_routing_config()
+		if self._read_config_tag('Reset/Clear and reload on next restart'):
+			self.clear()
+			self._write_config_tag('Reset/Clear and reload on next restart', False)
+		else:
+			self._initialize_destination_contents()
+			self._initialize_carrier_contents()
+
+	# ------------------------------------------------------------------
+	# CORE DUMPS
+	# ------------------------------------------------------------------
+	@property
+	def _core_dump_dir(self):
+		core_dump_dir = self.config['log_path'] + '/' + 'coredump'
+		if not os.path.exists(core_dump_dir):
+			os.makedirs(core_dump_dir)
+		return core_dump_dir
+
+	def _dump_core(self):
+		json_payload = self._generate_contents_json()
+		timestamp = datetime.now().isoformat('_').replace(':', '')[:17]
+		filepath = self._core_dump_dir + '/' + 'core_dump.' + timestamp + '.json'
+		with open(filepath, 'w') as f:
+			f.write(json_payload)
+		self.logger.warn('Sorter data dumped core at {filepath}', filepath=filepath)
+
+	def _generate_contents_json(self):
+		info = {
+			'_id': self.name,
+			'chutes': dict(self._destination_contents),
+			'carriers': dict(self._carrier_contents),
+			'last_updated': system.date.now(),
+		}
+		return self._serialize_to_json(info)
+
+	def _serialize_to_json(self, something):
+		return json.dumps(something, indent=2, sort_keys=True, default=repr)
+
+	def _on_jvm_shutdown(self):
+		self._dump_core()
+		super(EuroSorterContentTracking, self)._on_jvm_shutdown()
+
+	# ------------------------------------------------------------------
+	# MONGO HELPERS
+	# ------------------------------------------------------------------
+	def _load_sorter_doc(self):
+		raw = select_record(MONGODB, MONGO_COLL, {'_id': self.name})
+		doc_from_db = None
+
+		if isinstance(raw, dict):
+			doc_from_db = raw
+		elif isinstance(raw, (list, tuple)):
+			for item in raw:
+				if isinstance(item, dict):
+					doc_from_db = item
+					break
+
+		if doc_from_db:
+			chutes   = doc_from_db.get('chutes')   or {}
+			carriers = doc_from_db.get('carriers') or {}
+
+			try:
+				chutes = dict(chutes)
+			except Exception:
+				chutes = {}
+
+			try:
+				carriers = dict(carriers)
+			except Exception:
+				carriers = {}
+
+			doc = {
+				'_id':          self.name,
+				'chutes':       chutes,
+				'carriers':     carriers,
+				'last_updated': system.date.now(),
+			}
+			return True, doc
+
+		doc = {
+			'_id':          self.name,
+			'chutes':       {},
+			'carriers':     {},
+			'last_updated': system.date.now(),
+		}
+		return False, doc
+
+	def _serialize_destination_for_mongo(self, record):
+		if record is None:
+			return {}
+		try:
+			return dict(record)
+		except Exception:
+			return {'value': repr(record)}
+
+	def _serialize_carrier_for_mongo(self, record):
+		if record is None:
+			return {}
+		try:
+			return dict(record)
+		except Exception:
+			return {'value': repr(record)}
+
+	def _sync_destination_to_mongo(self, dest_key):
+		dest_key = str(dest_key)
+		dest_rec = self._destination_contents.get(dest_key)
+		if dest_rec is None:
+			return
+
+		status, doc = self._load_sorter_doc()
+		chutes = doc.get('chutes', {}) if status else {}
+
+		chutes[dest_key] = self._serialize_destination_for_mongo(dest_rec)
+
+		doc['chutes'] = chutes
+		doc['last_updated'] = system.date.now()
+
+		upsert_record(MONGODB, MONGO_COLL, doc, {'_id': self.name})
+
+	def _sync_carrier_to_mongo(self, carrier_number):
+		num = self._coerce_carrier_number(carrier_number)
+		carrier_rec = self._carrier_contents.get(num)
+		if carrier_rec is None:
+			return
+
+		status, doc = self._load_sorter_doc()
+		carriers = doc.get('carriers', {}) if status else {}
+
+		carriers[str(num)] = self._serialize_carrier_for_mongo(carrier_rec)
+
+		doc['carriers'] = carriers
+		doc['last_updated'] = system.date.now()
+
+		upsert_record(MONGODB, MONGO_COLL, doc, {'_id': self.name})
+
+	def _sync_all_to_mongo(self):
+		chutes_doc = {}
+		for k, rec in self._destination_contents.items():
+			chutes_doc[k] = self._serialize_destination_for_mongo(rec)
+
+		carriers_doc = {}
+		for num, rec in self._carrier_contents.items():
+			carriers_doc[str(num)] = self._serialize_carrier_for_mongo(rec)
+
+		doc = {
+			'_id': self.name,
+			'chutes': chutes_doc,
+			'carriers': carriers_doc,
+			'last_updated': system.date.now(),
+		}
+		upsert_record(MONGODB, MONGO_COLL, doc, {'_id': self.name})
+
+	# ------------------------------------------------------------------
+	# DESTINATION CONTENTS (ExtraGlobal)
+	# ------------------------------------------------------------------
+	@property
+	def _destination_contents(self):
+		try:
+			return ExtraGlobal.access(self.name, self.DESTINATION_CONTENT_CACHE_SCOPE)
+		except KeyError:
+			self.logger.warn('Destination contents not initialized. Setting up...')
+			self._initialize_destination_contents(full_clear=True)
+			return ExtraGlobal.access(self.name, self.DESTINATION_CONTENT_CACHE_SCOPE)
+
+	def clear(self):
+		self.logger.warn('Clearing all tracking data from sorter %s' % self.name)
+		self.log_event('tracking', reason='clear')
+		self._dump_core()
+
+		try:
+			ExtraGlobal.trash(self.name, self.DESTINATION_CONTENT_CACHE_SCOPE)
+		except KeyError:
+			pass
+		try:
+			ExtraGlobal.trash(self.name, self.CARRIERS_CACHE_SCOPE)
+		except KeyError:
+			pass
+
+		self._initialize_destination_contents(full_clear=True)
+		self._initialize_carrier_contents(full_clear=True)
+
+		self._sync_all_to_mongo()
+
+	def _get_wcs_name(self, dest_string):
+		dest_string = str(dest_string)
+		cfg = self._get_sorter_config()
+		machine_name = cfg.get('wcs_prefix', 'X')
+
+		parts = dest_string.split('-')
+		station = int(parts[1])
+		chute = int(parts[2])
+		dest = int(parts[3]) if len(parts) > 3 else 1
+		side = parts[4] if len(parts) > 4 else 'A'
+
+		chutename = "{machine_name}{station:04d}{chute}{dest}{side}".format(
+			machine_name=machine_name,
+			station=station,
+			chute=chute,
+			dest=dest,
+			side=side
+		)
+		return chutename
+
+	def _init_destination(self, dest_string):
+		cfg = self._get_sorter_config()
+		sorter_default = self._clone(cfg.get('chute_default') or {})
+		wcs = self._get_wcs_name(str(dest_string))
+
+		base = self._clone(COMMON_CHUTE_DEFAULT)
+		base['_id'] = str(dest_string)
+		base['destination'] = str(dest_string)
+		base['chuteName'] = wcs
+		base['sorter'] = self.name
+		base['position'] = self._get_position_from_destination(dest_string)
+		base['chute_info'] = sorter_default
+		base['last_updated'] = None
+
+		base = self._apply_physical_behavior_defaults(base)
+
+		return base
+
+	def _normalize_loaded_destination_record(self, dest_key, rec_dict):
+		base = self._init_destination(dest_key)
+
+		if not isinstance(rec_dict, dict):
+			return base
+
+		base.update({
+			'_id': rec_dict.get('_id', base['_id']),
+			'destination': rec_dict.get('destination', base['destination']),
+			'chuteName': rec_dict.get('chuteName', base['chuteName']),
+			'sorter': rec_dict.get('sorter', base['sorter']),
+			'faulted': rec_dict.get('faulted', base['faulted']),
+			'in_service': rec_dict.get('in_service', rec_dict.get('enabled', base['in_service'])),
+			'position': rec_dict.get('position', base['position']),
+			'chute_type': rec_dict.get('chute_type', base['chute_type']),
+			'lane': rec_dict.get('lane', base['lane']),
+			'occupied': rec_dict.get('occupied', base['occupied']),
+			'available': rec_dict.get('available', base['available']),
+			'dfs': rec_dict.get('dfs', base['dfs']),
+			'ofs': rec_dict.get('ofs', base['ofs']),
+			'first_item_delivered_ts': rec_dict.get('first_item_delivered_ts', base['first_item_delivered_ts']),
+			'has_upper_lower': rec_dict.get('has_upper_lower', base['has_upper_lower']),
+			'has_front_rear': rec_dict.get('has_front_rear', base['has_front_rear']),
+			'has_gate': rec_dict.get('has_gate', base['has_gate']),
+			'enroute': rec_dict.get('enroute', base['enroute']),
+			'enqueue': rec_dict.get('enqueue', base['enqueue']),
+			'delivered': rec_dict.get('delivered', base['delivered']),
+			'last_updated': rec_dict.get('last_updated', base['last_updated']),
+		})
+
+		chute_info = base.get('chute_info') or {}
+		loaded_chute_info = rec_dict.get('chute_info')
+
+		if isinstance(loaded_chute_info, dict):
+			chute_info.update(loaded_chute_info)
+
+		for k, v in rec_dict.items():
+			if k in (
+				'_id', 'destination', 'chuteName', 'sorter',
+				'faulted', 'in_service', 'enabled', 'position', 'chute_type',
+				'lane', 'occupied', 'available', 'dfs', 'ofs',
+				'first_item_delivered_ts',
+				'has_upper_lower', 'has_front_rear', 'has_gate',
+				'enroute', 'enqueue', 'delivered', 'last_updated'
+			):
+				continue
+			if k == 'chute_info':
+				continue
+			chute_info[k] = v
+
+		base['chute_info'] = chute_info
+		base = self._apply_physical_behavior_defaults(base)
+		return base
+
+	def _initialize_destination_contents(self, full_clear=False):
+		if not full_clear:
+			try:
+				destination_contents = ExtraGlobal.access(self.name, self.DESTINATION_CONTENT_CACHE_SCOPE)
+			except KeyError:
+				full_clear = True
+
+		if full_clear:
+			self.logger.warn('Reinitializing destination contents for sorter %s' % self.name)
+			self.log_event('tracking', reason='reinitialize-contents')
+
+			destination_contents = {}
+			ExtraGlobal.stash(
+				destination_contents,
+				self.name, self.DESTINATION_CONTENT_CACHE_SCOPE,
+				lifespan=self.CARRIERS_LIFESPAN_SEC,
+			)
+
+		for dest_string in self._destination_mapping:
+			if dest_string not in destination_contents:
+				destination_contents[dest_string] = self._init_destination(dest_string)
+
+		try:
+			status, doc = self._load_sorter_doc()
+			mongo_chutes = doc.get('chutes')
+			if mongo_chutes:
+				for dest_key, rec_dict in mongo_chutes.items():
+					destination_contents[dest_key] = self._normalize_loaded_destination_record(dest_key, rec_dict)
+		except Exception as e:
+			self.logger.warn(
+				'Failed to hydrate destination contents from Mongo for sorter {name}: {err}',
+				name=self.name,
+				err=e
+			)
+
+		self.logger.trace(
+			'Initialized/verified destination metadata for {n} destinations (with Mongo hydration)',
+			n=len(destination_contents)
+		)
+
+	def destination_get(self, identifier):
+		if isinstance(identifier, Destination):
+			key = identifier.destination
+		elif isinstance(identifier, dict) and 'destination' in identifier:
+			key = identifier['destination']
+		else:
+			key = identifier
+		return self._destination_contents.get(key)
+
+	def destination_update(self, identifier, updates=None, **extra_updates):
+		if isinstance(identifier, Destination):
+			dest_key = identifier.destination
+		elif isinstance(identifier, dict) and 'destination' in identifier:
+			dest_key = identifier['destination']
+		else:
+			dest_key = identifier
+
+		dest_contents = self._destination_contents
+
+		record = dest_contents.get(dest_key)
+		if record is None:
+			record = self._init_destination(dest_key)
+
+		if not isinstance(record, dict):
+			try:
+				record = dict(record)
+			except Exception:
+				record = self._init_destination(dest_key)
+
+		merged = {}
+		if isinstance(updates, dict):
+			merged.update(updates)
+		merged.update(extra_updates)
+
+		common_keys = set(COMMON_CHUTE_DEFAULT.keys())
+		new_record = self._clone(record)
+		chute_info = new_record.get('chute_info') or {}
+		if not isinstance(chute_info, dict):
+			chute_info = {}
+
+		for key, value in merged.items():
+			if key == 'chute_info' and isinstance(value, dict):
+				chute_info.update(value)
+			elif key in common_keys:
+				new_record[key] = value
+			else:
+				chute_info[key] = value
+
+		mode = self._get_sorter_mode()
+
+		if mode == 'level2':
+			if not bool(chute_info.get('assigned')):
+				chute_info['assigned_name'] = ''
+
+		elif mode == 'level3':
+			if new_record.get('occupied') is False:
+				chute_info['zone'] = ''
+				chute_info['group_id'] = ''
+
+		elif mode == 'level3_ship':
+			pass
+
+		new_record['chute_info'] = chute_info
+		new_record['_id'] = str(dest_key)
+		new_record['destination'] = str(dest_key)
+		new_record['chuteName'] = new_record.get('chuteName') or self._get_wcs_name(str(dest_key))
+		new_record['sorter'] = self.name
+		new_record['position'] = new_record.get('position') or self._get_position_from_destination(dest_key)
+		new_record['last_updated'] = system.date.now()
+
+		new_record = self._apply_physical_behavior_defaults(new_record)
+
+		if mode in ('level2', 'level3', 'level3_ship'):
+			chute_info['lastUpdated'] = datetime.now()
+
+		dest_contents[dest_key] = new_record
+
+		self._sync_destination_to_mongo(dest_key)
+
+		try:
+			base_tag_path = '[EuroSort]EuroSort/%s/Destinations/%s/' % (self.name, dest_key)
+			tag_field_map = self._get_sorter_config().get('tag_field_map') or {}
+			flat_record = self._flatten_destination_record_for_tags(new_record)
+
+			write_paths = []
+			write_values = []
+
+			for field_name, tag_suffix in tag_field_map.items():
+				if field_name not in flat_record:
+					continue
+
+				value = flat_record.get(field_name)
+
+				if isinstance(value, bool):
+					value = bool(value)
+				elif isinstance(value, (int, long, float)):
+					value = value
+				elif isinstance(value, (list, dict, tuple)):
+					value = json.dumps(value, default=repr)
+				elif value is None:
+					value = ''
+				else:
+					value = str(value)
+
+				write_paths.append(base_tag_path + tag_suffix)
+				write_values.append(value)
+
+			if write_paths:
+				system.tag.writeBlocking(write_paths, write_values)
+
+		except Exception:
+			pass
+
+		return new_record
+
+	def clear_level2_assignment(self, dest_key):
+		if self._get_sorter_mode() != 'level2':
+			return None
+		return self.destination_update(
+			dest_key,
+			assigned=False,
+			assigned_name='',
+			assigned_mode='',
+		)
+
+	def clear_level3_occupancy(self, dest_key):
+		if self._get_sorter_mode() != 'level3':
+			return None
+		return self.destination_update(
+			dest_key,
+			occupied=False,
+			available=True,
+			zone='',
+			group_id='',
+			ibns='',
+			chuteCount=0,
+			volume=0.0,
+			volume_percent_full=0.0,
+			chuteFull=False,
+			toteFull=False,
+		)
+
+	def clear_level3_ship_occupancy(self, dest_key):
+		if self._get_sorter_mode() != 'level3_ship':
+			return None
+		return self.destination_update(
+			dest_key,
+			occupied=False,
+			available=True,
+			first_item_delivered_ts=None,
+			ready_for_packout=False,
+			missing_ibns=[],
+			expected_line_count=0,
+			order_count_total=0,
+			item_count_total=0,
+			line_count_total=0,
+			percent_orders_consolidated=0.0,
+			oldest_order_age_sec=0,
+			batch_door_state='UP',
+			rear_drop_pending=False,
+			rear_drop_complete=False,
+			orders=[],
+			ibns=[],
+		)
+
+	# ------------------------------------------------------------------
+	# CARRIER CONTENTS (ExtraGlobal)
+	# ------------------------------------------------------------------
+	@property
+	def _carrier_contents(self):
+		try:
+			return ExtraGlobal.access(self.name, self.CARRIERS_CACHE_SCOPE)
+		except KeyError:
+			self.logger.warn('Carriers cache not initialized. Setting up...')
+			self._initialize_carrier_contents(full_clear=True)
+			return ExtraGlobal.access(self.name, self.CARRIERS_CACHE_SCOPE)
+
+	def _initialize_carrier_contents(self, full_clear=True):
+		if not full_clear:
+			try:
+				carrier_contents = ExtraGlobal.access(self.name, self.CARRIERS_CACHE_SCOPE)
+			except KeyError:
+				full_clear = True
+
+		if full_clear:
+			self.logger.warn('Reinitializing carrier data for sorter %s' % self.name)
+			self.log_event('tracking', reason='reinitialize-carriers')
+
+			carrier_contents = {}
+			ExtraGlobal.stash(
+				carrier_contents,
+				self.name, self.CARRIERS_CACHE_SCOPE,
+				lifespan=self.CARRIERS_LIFESPAN_SEC,
+			)
+
+		cfg = self._get_sorter_config()
+
+		self.CARRIERS_MIN = 1
+		self.CARRIERS_MAX = cfg.get('carrier_max')
+		if not self.CARRIERS_MAX:
+			raise ValueError('carrier_max not configured for sorter %s' % self.name)
+
+		for carrier_num in range(self.CARRIERS_MIN, self.CARRIERS_MAX + 1):
+			if carrier_num not in carrier_contents:
+				carrier_contents[carrier_num] = self._init_carrier(carrier_num)
+
+		try:
+			status, doc = self._load_sorter_doc()
+			mongo_carriers = doc.get('carriers')
+			if mongo_carriers:
+				for num_str, rec_dict in mongo_carriers.items():
+					if not isinstance(rec_dict, dict):
+						continue
+					try:
+						num = int(num_str)
+					except Exception:
+						continue
+					if num < self.CARRIERS_MIN or num > self.CARRIERS_MAX:
+						continue
+					base = self._init_carrier(num)
+					base.update(rec_dict)
+					carrier_contents[num] = base
+		except Exception as e:
+			self.logger.warn(
+				'Failed to hydrate carrier contents from Mongo for sorter {name}: {err}',
+				name=self.name,
+				err=e
+			)
+
+		self.logger.trace(
+			'Initialized/verified carrier metadata for {n} carriers (with Mongo hydration)',
+			n=len(carrier_contents)
+		)
+
+	def _init_carrier(self, n):
+		return {
+			'carrier_number': n,
+			'issue_info': {},
+			'track_id': None,
+			'in_service': True,
+			'assigned_name': None,
+			'assigned_mode': None,
+			'recirculation_count': 0,
+			'destination': None,
+			'induct_scanner': None,
+			'delivered': 0,
+			'discharged_attempted': False,
+			'failed_deliveries': 0,
+			'deliveries_aborted': 0,
+			'unknown_deliveries': 0,
+			'last_updated': None,
+		}
+
+	def carriers_clear(self):
+		self.logger.warn('Clearing carriers cache for sorter {name}', name=self.name)
+		try:
+			ExtraGlobal.trash(self.name, self.CARRIERS_CACHE_SCOPE)
+		except KeyError:
+			pass
+		self._initialize_carrier_contents(full_clear=True)
+		self._sync_all_to_mongo()
+
+	def carriers_all(self):
+		return self._carrier_contents
+
+	def carrier_get(self, carrier_number):
+		if not carrier_number:
+			return None
+		num = self._coerce_carrier_number(carrier_number)
+		return self._carrier_contents.get(num)
+
+	def _coerce_carrier_number(self, value):
+		if isinstance(value, (int, long)):
+			num = value
+		elif isinstance(value, (str, unicode)):
+			s = value.strip()
+			if not s.isdigit():
+				raise ValueError('Carrier number must be numeric string: %r' % value)
+			num = int(s)
+		else:
+			raise TypeError('Carrier number must be int or numeric string, not %r' % type(value))
+
+		if not (self.CARRIERS_MIN <= num <= self.CARRIERS_MAX):
+			raise ValueError(
+				'Carrier number out of range (%d..%d): %r'
+				% (self.CARRIERS_MIN, self.CARRIERS_MAX, num)
+			)
+		return num
+
+	def carrier_update(self, carrier_number, updates=None, **extra_updates):
+		num = self._coerce_carrier_number(carrier_number)
+		carriers = self._carrier_contents
+
+		record = carriers.get(num)
+		if record is None:
+			record = self._init_carrier(num)
+
+		if not isinstance(record, dict):
+			try:
+				record = dict(record)
+			except Exception:
+				record = self._init_carrier(num)
+
+		merged = {}
+		if isinstance(updates, dict):
+			merged.update(updates)
+		merged.update(extra_updates)
+		merged['last_updated'] = system.date.now()
+
+		record.update(merged)
+		carriers[num] = record
+
+		self._sync_carrier_to_mongo(num)
+
+		return record
+
+	def update_carrier_and_destination(self,
+	                                   carrier_number,
+	                                   dest_identifier=None,
+	                                   carrier_updates=None,
+	                                   dest_updates=None):
+		rec_carrier = None
+		rec_dest = None
+
+		if carrier_updates:
+			rec_carrier = self.carrier_update(carrier_number, carrier_updates)
+
+		if dest_identifier is not None and dest_updates:
+			rec_dest = self.destination_update(dest_identifier, dest_updates)
+
+		return rec_carrier, rec_dest
+
+	def assign_carrier_to_destination(self,
+	                                  carrier_number,
+	                                  dest_identifier,
+	                                  scanner=None,
+	                                  track_id=None,
+	                                  assigned_name=None,
+	                                  assigned_mode=None,
+	                                  transit_info=None,
+	                                  extra_carrier_updates=None,
+	                                  extra_dest_updates=None):
+		if extra_carrier_updates is None:
+			extra_carrier_updates = {}
+		if extra_dest_updates is None:
+			extra_dest_updates = {}
+		if transit_info is None:
+			transit_info = {}
+
+		carrier_updates = dict(extra_carrier_updates)
+		carrier_updates['destination'] = dest_identifier
+		carrier_updates['issue_info'] = transit_info
+		carrier_updates['assigned_name'] = assigned_name
+		carrier_updates['assigned_mode'] = assigned_mode
+
+		if track_id is not None:
+			carrier_updates['track_id'] = track_id
+
+		if scanner:
+			rec_carrier = self.carrier_get(carrier_number)
+			existing_scanner = rec_carrier.get('induct_scanner') if rec_carrier else None
+			if existing_scanner in (None, '', 'null'):
+				carrier_updates['induct_scanner'] = scanner
+
+		dest_rec = self.destination_get(dest_identifier) or {}
+
+		current_enqueue = dest_rec.get('enqueue', 0) or 0
+		new_enqueue = current_enqueue + 1
+
+		dest_updates = dict(extra_dest_updates)
+		dest_updates['enqueue'] = new_enqueue
+
+		if transit_info:
+			chute_info = {}
+			existing_ci = dest_rec.get('chute_info') or {}
+			if isinstance(existing_ci, dict):
+				chute_info.update(existing_ci)
+
+			current_transit = chute_info.get('transit_info', {}) or {}
+			if not isinstance(current_transit, dict):
+				try:
+					current_transit = dict(current_transit)
+				except Exception:
+					current_transit = {}
+
+			current_transit.update(transit_info)
+			chute_info['transit_info'] = current_transit
+			dest_updates['chute_info'] = chute_info
+
+		return self.update_carrier_and_destination(
+			carrier_number,
+			dest_identifier,
+			carrier_updates=carrier_updates,
+			dest_updates=dest_updates
+		)
+
+	def _decrement_destination_enqueue(self, dest_identifier):
+		if not dest_identifier:
+			return None
+
+		dest_rec = self.destination_get(dest_identifier)
+		if dest_rec is None:
+			return None
+
+		current_enqueue = dest_rec.get('enqueue', 0) or 0
+		new_enqueue = current_enqueue - 1
+		if new_enqueue < 0:
+			new_enqueue = 0
+
+		return self.destination_update(dest_identifier, {'enqueue': new_enqueue})
+
+	def mark_carrier_attempted(self, carrier_number, **extra_carrier_updates):
+		num = self._coerce_carrier_number(carrier_number)
+		rec = self.carrier_get(num)
+		if rec is None:
+			rec = self._init_carrier(num)
+
+		updates = dict(extra_carrier_updates or {})
+		updates['discharged_attempted'] = True
+
+		return self.carrier_update(num, updates)
+
+	def mark_carrier_delivered(self, carrier_number, **extra_carrier_updates):
+		num = self._coerce_carrier_number(carrier_number)
+		rec_carrier = self.carrier_get(num)
+		if rec_carrier is None:
+			rec_carrier = self._init_carrier(num)
+
+		dest_identifier = rec_carrier.get('destination')
+
+		current_delivered = rec_carrier.get('delivered', 0) or 0
+		carrier_updates = dict(extra_carrier_updates or {})
+		carrier_updates['delivered'] = current_delivered + 1
+		carrier_updates['discharged_attempted'] = True
+		carrier_updates['assigned_name'] = None
+		carrier_updates['assigned_mode'] = None
+
+		dest_updates = None
+		if dest_identifier:
+			dest_rec = self.destination_get(dest_identifier)
+			if dest_rec is not None:
+				dest_delivered = dest_rec.get('delivered', 0) or 0
+				dest_enqueue = dest_rec.get('enqueue', 0) or 0
+				new_enqueue = dest_enqueue - 1
+				if new_enqueue < 0:
+					new_enqueue = 0
+				dest_updates = {
+					'delivered': dest_delivered + 1,
+					'enqueue': new_enqueue,
+				}
+
+				if not dest_rec.get('first_item_delivered_ts'):
+					dest_updates['first_item_delivered_ts'] = system.date.now()
+
+		return self.update_carrier_and_destination(
+			carrier_number=num,
+			dest_identifier=dest_identifier,
+			carrier_updates=carrier_updates,
+			dest_updates=dest_updates,
+		)
+
+	def mark_carrier_failed(self, carrier_number, **extra_carrier_updates):
+		num = self._coerce_carrier_number(carrier_number)
+		rec_carrier = self.carrier_get(num)
+		if rec_carrier is None:
+			rec_carrier = self._init_carrier(num)
+
+		dest_identifier = rec_carrier.get('destination')
+
+		current_failed = rec_carrier.get('failed_deliveries', 0) or 0
+		carrier_updates = dict(extra_carrier_updates or {})
+		carrier_updates['failed_deliveries'] = current_failed + 1
+		carrier_updates['discharged_attempted'] = True
+
+		dest_updates = None
+		if dest_identifier:
+			dest_rec = self.destination_get(dest_identifier)
+			if dest_rec is not None:
+				current_enqueue = dest_rec.get('enqueue', 0) or 0
+				new_enqueue = current_enqueue - 1
+				if new_enqueue < 0:
+					new_enqueue = 0
+				dest_updates = {'enqueue': new_enqueue}
+
+		return self.update_carrier_and_destination(
+			carrier_number=num,
+			dest_identifier=dest_identifier,
+			carrier_updates=carrier_updates,
+			dest_updates=dest_updates,
+		)
+
+	def mark_carrier_aborted(self, carrier_number, **extra_carrier_updates):
+		num = self._coerce_carrier_number(carrier_number)
+		rec_carrier = self.carrier_get(num)
+		if rec_carrier is None:
+			rec_carrier = self._init_carrier(num)
+
+		dest_identifier = rec_carrier.get('destination')
+
+		current_aborted = rec_carrier.get('deliveries_aborted', 0) or 0
+		carrier_updates = dict(extra_carrier_updates or {})
+		carrier_updates['deliveries_aborted'] = current_aborted + 1
+		carrier_updates['discharged_attempted'] = True
+
+		dest_updates = None
+		if dest_identifier:
+			dest_rec = self.destination_get(dest_identifier)
+			if dest_rec is not None:
+				current_enqueue = dest_rec.get('enqueue', 0) or 0
+				new_enqueue = current_enqueue - 1
+				if new_enqueue < 0:
+					new_enqueue = 0
+				dest_updates = {'enqueue': new_enqueue}
+
+		return self.update_carrier_and_destination(
+			carrier_number=num,
+			dest_identifier=dest_identifier,
+			carrier_updates=carrier_updates,
+			dest_updates=dest_updates,
+		)
+
+	def mark_carrier_unknown(self, carrier_number, **extra_carrier_updates):
+		num = self._coerce_carrier_number(carrier_number)
+		rec_carrier = self.carrier_get(num)
+		if rec_carrier is None:
+			rec_carrier = self._init_carrier(num)
+
+		dest_identifier = rec_carrier.get('destination')
+
+		issue_info = rec_carrier.get('issue_info', {}) or {}
+		if not isinstance(issue_info, dict):
+			try:
+				issue_info = dict(issue_info)
+			except Exception:
+				issue_info = {}
+
+		issue_info.setdefault('status', 'UNKNOWN')
+
+		carrier_updates = dict(extra_carrier_updates or {})
+		carrier_updates.setdefault('issue_info', issue_info)
+		carrier_updates['discharged_attempted'] = True
+
+		dest_updates = None
+		if dest_identifier:
+			dest_rec = self.destination_get(dest_identifier)
+			if dest_rec is not None:
+				current_enqueue = dest_rec.get('enqueue', 0) or 0
+				new_enqueue = current_enqueue - 1
+				if new_enqueue < 0:
+					new_enqueue = 0
+				dest_updates = {'enqueue': new_enqueue}
+
+		return self.update_carrier_and_destination(
+			carrier_number=num,
+			dest_identifier=dest_identifier,
+			carrier_updates=carrier_updates,
+			dest_updates=dest_updates,
+		)
+
+	# ------------------------------------------------------------------
+	# SUMMARY / INTROSPECTION
+	# ------------------------------------------------------------------
+	def destinations_all_transit_info(self):
+		out = {}
+		for dest_key, rec in self._destination_contents.items():
+			if rec is None:
+				out[dest_key] = {}
+				continue
+
+			chute_info = rec.get('chute_info', {}) or {}
+			ti = chute_info.get('transit_info', {}) or {}
+
+			try:
+				out[dest_key] = dict(ti)
+			except Exception:
+				out[dest_key] = {}
+
+		return out
+
+	def destinations_all_chute_info(self):
+		out = {}
+		for dest_key, rec in self._destination_contents.items():
+			if rec is None:
+				out[dest_key] = {}
+				continue
+
+			ci = rec.get('chute_info', {}) or {}
+			try:
+				out[dest_key] = dict(ci)
+			except Exception:
+				out[dest_key] = {}
+
+		return out
+
+	def _sorted_destinations(self):
+		def sort_key(dest_key):
+			try:
+				d = Destination.parse(dest_key)
+				return (int(d.station), int(d.chute.value), int(d.dest), d.side.value)
+			except Exception:
+				return (9999, 9, 9999, dest_key)
+
+		return sorted(self.destinations_all_transit_info().keys(), key=sort_key)
