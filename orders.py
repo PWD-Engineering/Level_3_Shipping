@@ -924,7 +924,6 @@ class Level_3_OrderRouting(
 # ===========================================================================
 # LEVEL 2
 # ===========================================================================
-
 class Level_2_OrderRouting(
 	EuroSorterContentTracking,
 	EuroSorterPermissivePolling,
@@ -997,10 +996,10 @@ class Level_2_OrderRouting(
 		self.load_default_chutes()
 
 		if self._gp('reset_dict', False):
-			self._clear_chutes()
+			self.clear_all_destinations(reload_defaults=True)
 
 	# -----------------------------------------------------------------
-	# Shared destination helpers (new contents.py)
+	# Shared destination helpers
 	# -----------------------------------------------------------------
 
 	def _dest_info(self, rec):
@@ -1349,7 +1348,7 @@ class Level_2_OrderRouting(
 		return self._route_to_label()
 
 	def _route_noread(self):
-		max_count = int(self.get_permissive('max_noread_recirc'))
+		max_count = int(self.get_permissive('max_noread_recirc') or 0)
 		carrier = self.carrier or {}
 		recirc_count = carrier.get('recirculation_count', 0)
 		carrier_num = carrier.get('carrier_number', None)
@@ -1363,14 +1362,19 @@ class Level_2_OrderRouting(
 					recirculation_count=recirc_count
 				)
 
-		if recirc_count >= max_count:
+		self.logger.info(
+			"NOREAD recirc check carrier=%s scanner=%s induct_scanner=%s recirc=%s max=%s"
+			% (carrier_num, self.scanner_id, induct_scanner, recirc_count, max_count)
+		)
+
+		if max_count > 0 and recirc_count >= max_count:
 			assigned_name = 'NOREAD'
 			return self.get_chute_by_assigned_name(assigned_name)
 
 		return None
 
 	def _max_recirc(self):
-		max_recirc = int(self.get_permissive('max_resort_recirc'))
+		max_recirc = int(self.get_permissive('max_resort_recirc') or 0)
 		carrier = self.carrier or {}
 		recirc_count = carrier.get('recirculation_count', 0)
 		carrier_num = carrier.get('carrier_number', None)
@@ -1384,7 +1388,12 @@ class Level_2_OrderRouting(
 					recirculation_count=recirc_count
 				)
 
-		if recirc_count >= max_recirc:
+		self.logger.info(
+			"MAX_RECIRC check carrier=%s scanner=%s induct_scanner=%s recirc=%s max=%s"
+			% (carrier_num, self.scanner_id, induct_scanner, recirc_count, max_recirc)
+		)
+
+		if max_recirc > 0 and recirc_count >= max_recirc:
 			assigned_name = 'JACKPOT'
 			return self.get_chute_by_assigned_name(assigned_name)
 
@@ -1458,7 +1467,14 @@ class Level_2_OrderRouting(
 		oh_clearance = bool(issue_info.get('clearance_over', False))
 		missing_dims = self._has_missing_dims(issue_info)
 
-		if is_tote or missing_dims or oh_clearance:
+		if is_tote:
+			set_match_pattern = 1
+		elif missing_dims:
+			if assigned_mode == 'POST':
+				set_match_pattern = 3
+			else:
+				set_match_pattern = 1
+		elif oh_clearance:
 			set_match_pattern = 1
 		else:
 			set_match_pattern = 3
@@ -1620,6 +1636,19 @@ class Level_2_OrderRouting(
 	# ------------------------ main Level 2 routing -------------------------
 
 	def route_destination(self, sorter_data):
+		"""
+		Entry point for Level 2 routing.
+
+		Recirc behavior:
+		- NOREAD items use _route_noread() first
+		- all other non-DST routable items use _max_recirc() first
+		- if recirc thresholds are not hit, normal routing continues
+
+		Missing dims behavior:
+		- tote: use tote dims and upper chute only
+		- non-tote + missing dims + POST: route to level3_dest
+		- non-tote + missing dims + non-POST: upper chute only
+		"""
 		carrier_num = sorter_data.carrier_number
 		track_id = sorter_data.track_id
 
@@ -1696,24 +1725,31 @@ class Level_2_OrderRouting(
 		destination = None
 
 		try:
-			if router in ["NOREAD", "NOCODE", "NOSCAN", "JACKPOT", "UNRESOLVED", "SDR"]:
-				destination = self.get_chute_by_assigned_name(assigned_name, assigned_mode)
+			if router == 'NOREAD':
+				destination = self._route_noread()
+				if destination is None:
+					destination = self.get_chute_by_assigned_name(assigned_name, assigned_mode)
 
 			elif router == 'DST':
 				destination = code
 
 			else:
-				destination = self.get_chute_by_assigned_name(assigned_name, assigned_mode)
-				self.logger.info(
-					"attempting route barcode=%s assigned_name=%s assigned_mode=%s is_tote=%s destination=%s"
-					% (
-						code,
-						assigned_name,
-						assigned_mode,
-						self.issue_info.get('is_tote', False),
-						destination
-					)
-				)
+				destination = self._max_recirc()
+				if destination is None:
+					if router in ["NOCODE", "NOSCAN", "JACKPOT", "UNRESOLVED", "SDR"]:
+						destination = self.get_chute_by_assigned_name(assigned_name, assigned_mode)
+					else:
+						destination = self.get_chute_by_assigned_name(assigned_name, assigned_mode)
+						self.logger.info(
+							"attempting route barcode=%s assigned_name=%s assigned_mode=%s is_tote=%s destination=%s"
+							% (
+								code,
+								assigned_name,
+								assigned_mode,
+								self.issue_info.get('is_tote', False),
+								destination
+							)
+						)
 
 			if destination is not None:
 				self.assign_carrier_to_destination(
@@ -1721,9 +1757,19 @@ class Level_2_OrderRouting(
 					destination,
 					track_id=track_id,
 					scanner=self.scanner_id,
+					assigned_name=assigned_name,
+					assigned_mode=assigned_mode,
 					transit_info=self.issue_info
 				)
-				self.logger.info('attempting to route to %s' % destination)
+				self.logger.info(
+					"route_destination selected destination=%s carrier=%s router=%s recirc_count=%s"
+					% (
+						destination,
+						carrier_num,
+						router,
+						(self.carrier_get(carrier_num) or {}).get('recirculation_count', 0)
+					)
+				)
 				return destination
 
 			destination = self.get_chute_by_assigned_name(assigned_name, assigned_mode)
@@ -1733,9 +1779,19 @@ class Level_2_OrderRouting(
 					destination,
 					track_id=track_id,
 					scanner=self.scanner_id,
+					assigned_name=assigned_name,
+					assigned_mode=assigned_mode,
 					transit_info=self.issue_info
 				)
-				self.logger.info('attempting fallback route to %s' % destination)
+				self.logger.info(
+					"attempting fallback route to %s carrier=%s router=%s recirc_count=%s"
+					% (
+						destination,
+						carrier_num,
+						router,
+						(self.carrier_get(carrier_num) or {}).get('recirculation_count', 0)
+					)
+				)
 				return destination
 
 		except Exception:
@@ -2055,7 +2111,17 @@ class Level_2_OrderRouting(
 		clearance_over = bool(issue_info.get('clearance_over', False))
 		missing_dims = self._has_missing_dims(issue_info)
 
-		if is_tote or missing_dims or clearance_over:
+		if is_tote:
+			set_match_pattern = 1
+		elif missing_dims:
+			if assigned_mode == 'POST':
+				level3_dest = self.get_permissive('level3_dest')
+				if level3_dest:
+					return level3_dest
+				set_match_pattern = 3
+			else:
+				set_match_pattern = 1
+		elif clearance_over:
 			set_match_pattern = 1
 		else:
 			set_match_pattern = 3
@@ -2194,7 +2260,7 @@ class Level_2_OrderRouting(
 			if not discharged_attempted:
 				self.mark_carrier_attempted(carrier_num)
 
-		if message == MessageCode.DISCHARGED_AT_DESTINATION:
+		elif message == MessageCode.DISCHARGED_AT_DESTINATION:
 			self.mark_carrier_delivered(carrier_num)
 
 		elif message == MessageCode.DISCHARGE_FAILED:
