@@ -35,7 +35,7 @@ COMMON_CHUTE_DEFAULT = {
 	'faulted': False,
 	'in_service': True,
 	'position': None,                # FRONT | REAR | None
-	'chute_type': 'NORMAL',          # NORMAL | PACKOUT | HP | JACKPOT | INSPECTION | NOREAD | BAGGING
+	'chute_type': 'NORMAL',          # NORMAL | PACKOUT | HP | JACKPOT | INSPECTION | NOREAD | BAGGING | PURGE
 	'lane': 0,
 	'occupied': False,
 	'available': True,
@@ -101,9 +101,28 @@ LEVEL3_SHIP_CHUTE_DEFAULT = {
 	'line_count_total': 0,
 	'percent_orders_consolidated': 0.0,
 	'oldest_order_age_sec': 0,
+
+	# FIX #2: corrected idle/cleared state per UC9.8 — batch door is DOWN at rest,
+	# only raised when utilization threshold is exceeded
 	'batch_door_state': 'DOWN',      # UP | DOWN | UNKNOWN
+
+	# FIX #7: rear drop state fields belong in the default schema so they are
+	# always present and don't appear only after a clear operation
+	'rear_drop_pending': False,
+	'rear_drop_complete': False,
+
 	'orders': [],
 	'ibns': [],
+
+	# FIX #1: sort_codes needed to enforce UC9.2 — only one order per sort code
+	# per chute. Must be tracked as a first-class field to avoid iterating orders[].
+	'sort_codes': [],
+
+	# FIX #4: priority escalation flag per UC10.3 — if any order in this chute
+	# escalates to high priority while already consolidated here, this flag is set
+	# and the chute UI changes to red with a flashing light
+	'contains_priority_order': False,
+
 	'has_upper_lower': True,
 	'has_front_rear': True,
 	'has_gate': True,
@@ -169,6 +188,10 @@ SORTER_CONFIG = {
 	},
 	'Level3_Ship': {
 		'aliases': ('Level3_Ship', 'level3_ship', 'LEVEL3_SHIP', 'Level3Ship', 'level3ship'),
+		# FIX #6: TODO — confirm final carrier count with EuroSort. The spec's
+		# outstanding questions note the location count is unresolved (possibly
+		# 1,504 positions counting batch doors across 94 packs x 8 chutes).
+		# 999 is a placeholder until that is confirmed.
 		'carrier_max': 999,
 		'wcs_prefix': 'D',
 		'mode': 'level3_ship',
@@ -192,6 +215,10 @@ SORTER_CONFIG = {
 			'percent_orders_consolidated': 'percent_orders_consolidated',
 			'oldest_order_age_sec':        'oldest_order_age_sec',
 			'batch_door_state':            'batch_door_state',
+			'rear_drop_pending':           'rear_drop_pending',
+			'rear_drop_complete':          'rear_drop_complete',
+			'sort_codes':                  'sort_codes',
+			'contains_priority_order':     'contains_priority_order',
 			'orders':                      'orders',
 			'ibns':                        'ibns',
 			'enroute':                     'enroute',
@@ -410,14 +437,94 @@ class EuroSorterContentTracking(
 
 		return flat
 
+	# ------------------------------------------------------------------
+	# SHARED DESTINATION HELPERS
+	# Centralized here so Level2, Level3, and Level3_Ship all inherit
+	# the same implementation rather than each defining their own copy.
+	# ------------------------------------------------------------------
+
+	def _dest_info(self, rec):
+		"""Returns the chute_info dict from a destination record, or {}."""
+		if not isinstance(rec, dict):
+			return {}
+		info = rec.get('chute_info')
+		return info if isinstance(info, dict) else {}
+
+	def _dest_get(self, rec, key, default=None):
+		"""
+		Looks up a key in a destination record, checking the top-level
+		fields first and falling back to chute_info. This means callers
+		don't need to know whether a field lives at the common level or
+		the sorter-specific level.
+		"""
+		if not isinstance(rec, dict):
+			return default
+		if key in rec:
+			return rec.get(key, default)
+		info = rec.get('chute_info')
+		if isinstance(info, dict):
+			return info.get(key, default)
+		return default
+
+	def _dest_update(self, destination, common_updates=None, chute_updates=None):
+		"""
+		Convenience wrapper around destination_update that keeps common-level
+		and chute_info-level updates clearly separated. Merges chute_updates
+		into the existing chute_info rather than replacing it wholesale.
+		"""
+		common_updates = common_updates or {}
+		chute_updates  = chute_updates  or {}
+
+		current = self.destination_get(destination) or {}
+		current_info = current.get('chute_info')
+		if not isinstance(current_info, dict):
+			current_info = {}
+
+		merged = dict(common_updates)
+		if chute_updates:
+			merged['chute_info'] = dict(current_info, **chute_updates)
+
+		if 'last_updated' not in merged:
+			merged['last_updated'] = system.date.now()
+
+		self.destination_update(destination, merged)
+
 	def _apply_physical_behavior_defaults(self, new_record):
+		"""
+		FIX #5: Apply physical behavior flags per chute type. Previously all
+		non-BAGGING chutes received has_front_rear=True and has_gate=True, which
+		is incorrect for JACKPOT, NOREAD, HP, INSPECTION, and PURGE chutes that
+		do not have batch doors. Each type is now handled explicitly per the
+		spec (UC8.1).
+		"""
 		chute_type = str(new_record.get('chute_type', 'NORMAL')).strip().upper()
 
 		if chute_type == 'BAGGING':
+			# Bagging re-induction lane — single pass, no front/rear, no gate
 			new_record['has_upper_lower'] = False
 			new_record['has_front_rear'] = False
 			new_record['has_gate'] = False
+
+		elif chute_type in ('JACKPOT', 'NOREAD', 'PURGE'):
+			# Exception/purge lanes — items fall straight in, no batch door
+			new_record['has_upper_lower'] = True
+			new_record['has_front_rear'] = False
+			new_record['has_gate'] = False
+
+		elif chute_type == 'INSPECTION':
+			# Inspection chutes have upper/lower but no batch door (UC9.10)
+			new_record['has_upper_lower'] = True
+			new_record['has_front_rear'] = False
+			new_record['has_gate'] = False
+
+		elif chute_type == 'HP':
+			# High priority chutes have the same physical layout as NORMAL (UC9.4)
+			new_record['has_upper_lower'] = True
+			new_record['has_front_rear'] = True
+			new_record['has_gate'] = True
+
 		else:
+			# NORMAL / PACKOUT — full front/rear with batch door (UC7.1, UC9.7)
 			new_record['has_upper_lower'] = True
 			new_record['has_front_rear'] = True
 			new_record['has_gate'] = True
@@ -884,6 +991,12 @@ class EuroSorterContentTracking(
 	def clear_level3_ship_occupancy(self, dest_key):
 		if self._get_sorter_mode() != 'level3_ship':
 			return None
+		# FIX #2: batch_door_state corrected to 'DOWN' — per UC9.8 the batch door
+		# is down at rest and only raised when the utilization threshold is exceeded.
+		# FIX #7: rear_drop_pending and rear_drop_complete are now defined in the
+		# default schema, so they are safe to reset here without surprise.
+		# FIX #1: sort_codes reset to empty list so UC9.2 enforcement starts clean.
+		# FIX #4: contains_priority_order reset to False on occupancy clear.
 		return self.destination_update(
 			dest_key,
 			occupied=False,
@@ -897,12 +1010,86 @@ class EuroSorterContentTracking(
 			line_count_total=0,
 			percent_orders_consolidated=0.0,
 			oldest_order_age_sec=0,
-			batch_door_state='UP',
+			batch_door_state='DOWN',
 			rear_drop_pending=False,
 			rear_drop_complete=False,
+			sort_codes=[],
+			contains_priority_order=False,
 			orders=[],
 			ibns=[],
 		)
+
+	# ------------------------------------------------------------------
+	# LEVEL3_SHIP SORT CODE ENFORCEMENT (UC9.2)
+	# ------------------------------------------------------------------
+	def chute_has_sort_code(self, dest_key, sort_code):
+		"""
+		Returns True if the given sort code is already present in this chute.
+		Used to enforce UC9.2 — a chute may only hold one order per sort code.
+		"""
+		if self._get_sorter_mode() != 'level3_ship':
+			return False
+		rec = self.destination_get(dest_key)
+		if rec is None:
+			return False
+		chute_info = rec.get('chute_info') or {}
+		sort_codes = chute_info.get('sort_codes') or []
+		return sort_code in sort_codes
+
+	def add_sort_code_to_chute(self, dest_key, sort_code):
+		"""
+		Adds a sort code to the chute's tracked list.
+		Should be called when an order is assigned to this chute (UC9.2).
+		"""
+		if self._get_sorter_mode() != 'level3_ship':
+			return None
+		rec = self.destination_get(dest_key)
+		if rec is None:
+			return None
+		chute_info = rec.get('chute_info') or {}
+		sort_codes = list(chute_info.get('sort_codes') or [])
+		if sort_code not in sort_codes:
+			sort_codes.append(sort_code)
+		return self.destination_update(dest_key, sort_codes=sort_codes)
+
+	def remove_sort_code_from_chute(self, dest_key, sort_code):
+		"""
+		Removes a sort code from the chute's tracked list.
+		Should be called when an order is fully consolidated and removed (UC9.2).
+		"""
+		if self._get_sorter_mode() != 'level3_ship':
+			return None
+		rec = self.destination_get(dest_key)
+		if rec is None:
+			return None
+		chute_info = rec.get('chute_info') or {}
+		sort_codes = list(chute_info.get('sort_codes') or [])
+		if sort_code in sort_codes:
+			sort_codes.remove(sort_code)
+		return self.destination_update(dest_key, sort_codes=sort_codes)
+
+	# ------------------------------------------------------------------
+	# LEVEL3_SHIP PRIORITY ESCALATION (UC10.3, UC10.4)
+	# ------------------------------------------------------------------
+	def flag_chute_priority_escalation(self, dest_key):
+		"""
+		Flags a chute as containing a high-priority order per UC10.3.
+		Called when an order's status changes to MST/MSQ while already
+		in a consolidation chute. The UI layer is responsible for rendering
+		the red overlay and flashing light based on this flag.
+		"""
+		if self._get_sorter_mode() != 'level3_ship':
+			return None
+		return self.destination_update(dest_key, contains_priority_order=True)
+
+	def clear_chute_priority_escalation(self, dest_key):
+		"""
+		Clears the priority escalation flag once the high-priority order
+		has been packed out or the chute is cleared.
+		"""
+		if self._get_sorter_mode() != 'level3_ship':
+			return None
+		return self.destination_update(dest_key, contains_priority_order=False)
 
 	# ------------------------------------------------------------------
 	# CARRIER CONTENTS (ExtraGlobal)
@@ -989,6 +1176,10 @@ class EuroSorterContentTracking(
 			'failed_deliveries': 0,
 			'deliveries_aborted': 0,
 			'unknown_deliveries': 0,
+			# FIX #3: UC5.6 requires that once an item is re-inducted from an OB
+			# chute it must NEVER divert to OB again. This flag makes that rule
+			# directly enforceable without having to infer it from other state.
+			'ob_reinducted': False,
 			'last_updated': None,
 		}
 
@@ -1141,6 +1332,17 @@ class EuroSorterContentTracking(
 			carrier_updates=carrier_updates,
 			dest_updates=dest_updates
 		)
+
+	def mark_carrier_ob_reinducted(self, carrier_number):
+		"""
+		FIX #3: Marks a carrier as having been re-inducted from an OB chute.
+		Per UC5.6, once set this carrier must never be diverted to OB again —
+		it recirculates indefinitely until a consolidation destination is available.
+		The routing layer should check carrier.get('ob_reinducted') before
+		sending an item to OB.
+		"""
+		num = self._coerce_carrier_number(carrier_number)
+		return self.carrier_update(num, ob_reinducted=True)
 
 	def _decrement_destination_enqueue(self, dest_identifier):
 		if not dest_identifier:

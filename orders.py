@@ -136,7 +136,11 @@ class Level_3_OrderRouting(
 			}
 		}
 
-		self._last_check_processed_chutes = system.date.now()
+		# FIX #3: two independent timestamps so each periodic fires on its own
+		# cadence without the 60-120s overlap bug
+		self._last_check_key_updates = system.date.now()
+		self._last_check_door_state  = system.date.now()
+
 		self._polling_methods.append(self._check_processed_chutes_periodic)
 		self._polling_methods.append(self._assign_initial_error_chutes)
 		self._polling_methods.append(self._get_chute_updates)
@@ -153,47 +157,6 @@ class Level_3_OrderRouting(
 			self._subscribe_control_permissive(perm, tag)
 
 		self._init_polling()
-
-	# -------------------------------------------------------------------------
-	# Shared destination helpers (new contents.py)
-	# -------------------------------------------------------------------------
-
-	def _dest_info(self, rec):
-		if not isinstance(rec, dict):
-			return {}
-		info = rec.get('chute_info')
-		return info if isinstance(info, dict) else {}
-
-	def _dest_get(self, rec, key, default=None):
-		if not isinstance(rec, dict):
-			return default
-
-		if key in rec:
-			return rec.get(key, default)
-
-		info = rec.get('chute_info')
-		if isinstance(info, dict):
-			return info.get(key, default)
-
-		return default
-
-	def _dest_update(self, destination, common_updates=None, chute_updates=None):
-		common_updates = common_updates or {}
-		chute_updates = chute_updates or {}
-
-		current = self.destination_get(destination) or {}
-		current_info = current.get('chute_info')
-		if not isinstance(current_info, dict):
-			current_info = {}
-
-		merged = dict(common_updates)
-		if chute_updates:
-			merged['chute_info'] = dict(current_info, **chute_updates)
-
-		if 'last_updated' not in merged:
-			merged['last_updated'] = system.date.now()
-
-		self.destination_update(destination, merged)
 
 	# -------------------------------------------------------------------------
 	# Small utilities
@@ -346,14 +309,18 @@ class Level_3_OrderRouting(
 				self._safe_tag_write([exec_path], [False])
 
 	def _check_processed_chutes_periodic(self):
+		# FIX #3: each check uses its own timestamp so neither blocks the other.
+		# Previously _last_check_processed_chutes was shared, causing
+		# _check_key_updates_for_chutes to fire on every poll between 60-120s.
 		now_ts = system.date.now()
 
-		if system.date.millisBetween(self._last_check_processed_chutes, now_ts) >= 60000:
+		if system.date.millisBetween(self._last_check_key_updates, now_ts) >= 60000:
 			self._check_key_updates_for_chutes()
+			self._last_check_key_updates = now_ts
 
-		if system.date.millisBetween(self._last_check_processed_chutes, now_ts) >= 120000:
+		if system.date.millisBetween(self._last_check_door_state, now_ts) >= 120000:
 			self._check_door_state()
-			self._last_check_processed_chutes = now_ts
+			self._last_check_door_state = now_ts
 
 	def _check_key_updates_for_chutes(self):
 		try:
@@ -924,6 +891,7 @@ class Level_3_OrderRouting(
 # ===========================================================================
 # LEVEL 2
 # ===========================================================================
+
 class Level_2_OrderRouting(
 	EuroSorterContentTracking,
 	EuroSorterPermissivePolling,
@@ -999,47 +967,8 @@ class Level_2_OrderRouting(
 			self.clear_all_destinations(reload_defaults=True)
 
 	# -----------------------------------------------------------------
-	# Shared destination helpers
+	# Helpers
 	# -----------------------------------------------------------------
-
-	def _dest_info(self, rec):
-		if not isinstance(rec, dict):
-			return {}
-		info = rec.get('chute_info')
-		return info if isinstance(info, dict) else {}
-
-	def _dest_get(self, rec, key, default=None):
-		if not isinstance(rec, dict):
-			return default
-
-		if key in rec:
-			return rec.get(key, default)
-
-		info = rec.get('chute_info')
-		if isinstance(info, dict):
-			return info.get(key, default)
-
-		return default
-
-	def _dest_update(self, destination, common_updates=None, chute_updates=None):
-		common_updates = common_updates or {}
-		chute_updates = chute_updates or {}
-
-		current = self.destination_get(destination) or {}
-		current_info = current.get('chute_info')
-		if not isinstance(current_info, dict):
-			current_info = {}
-
-		merged = dict(common_updates)
-		if chute_updates:
-			merged['chute_info'] = dict(current_info, **chute_updates)
-
-		if 'last_updated' not in merged:
-			merged['last_updated'] = system.date.now()
-
-		self.destination_update(destination, merged)
-
-	# ------------------------------ helpers --------------------------------
 
 	def _gp(self, name, default=None):
 		try:
@@ -1084,12 +1013,12 @@ class Level_2_OrderRouting(
 			cache_key = "SORTER_DESTINATIONS_%s" % self.name
 			ExtraGlobal[cache_key] = {}
 			self.logger.info("Cleared ExtraGlobal cache key: %s" % cache_key)
-		except Exception, e:
+		except Exception as e:  # FIX #4
 			self.logger.warn("Failed clearing ExtraGlobal destination cache: %s" % str(e))
 
 		try:
 			destination_names = list(self.destinations_all_transit_info().keys())
-		except Exception, e:
+		except Exception as e:  # FIX #4
 			self.logger.error("Unable to get destinations for clear: %s" % str(e))
 			destination_names = []
 
@@ -1114,7 +1043,7 @@ class Level_2_OrderRouting(
 					}
 				)
 				updated += 1
-			except Exception, e:
+			except Exception as e:  # FIX #4
 				self.logger.warn("Failed clearing destination %s: %s" % (destination, str(e)))
 
 		if reload_defaults:
@@ -1636,19 +1565,6 @@ class Level_2_OrderRouting(
 	# ------------------------ main Level 2 routing -------------------------
 
 	def route_destination(self, sorter_data):
-		"""
-		Entry point for Level 2 routing.
-
-		Recirc behavior:
-		- NOREAD items use _route_noread() first
-		- all other non-DST routable items use _max_recirc() first
-		- if recirc thresholds are not hit, normal routing continues
-
-		Missing dims behavior:
-		- tote: use tote dims and upper chute only
-		- non-tote + missing dims + POST: route to level3_dest
-		- non-tote + missing dims + non-POST: upper chute only
-		"""
 		carrier_num = sorter_data.carrier_number
 		track_id = sorter_data.track_id
 
@@ -2074,17 +1990,52 @@ class Level_2_OrderRouting(
 			'size_mode':      size_mode
 		})
 
-	# -------------------- destination sorting helper -----------------------
+	# -------------------------- verify handling ----------------------------
 
-	def _sorted_destinations(self):
-		def sort_key(dest_key):
-			try:
-				d = Destination.parse(dest_key)
-				return (int(d.station), int(d.chute.value), int(d.dest), d.side.value)
-			except Exception:
-				return (9999, 9, 9999, dest_key)
+	def handle_verify(self, sorter_data):
+		super(Level_2_OrderRouting, self).handle_verify(sorter_data)
 
-		return sorted(self.destinations_all_transit_info().keys(), key=sort_key)
+		raw_dest = sorter_data.destination
+		if not raw_dest:
+			return
+
+		chute_fields = raw_dest.split('-')
+		if len(chute_fields) < 5:
+			return
+
+		destination = 'DST-{station:04d}-{chute}-1-{side}'.format(
+			station=int(chute_fields[2]),
+			chute=chute_fields[3],
+			side=chute_fields[4]
+		)
+
+		carrier_num = sorter_data.carrier_number
+
+		self.issue_info = self.get_carrier_issue(carrier_num) or {}
+		self.logger.info('%s:%s' % (carrier_num, self.issue_info))
+
+		message = sorter_data.message_code
+		self.logger.info('%s:%s....type:%s' % (sorter_data.message_code, message, type(message)))
+		rec = self.carrier_get(carrier_num)
+		discharged_attempted = rec.get('discharged_attempted', False) if rec else False
+
+		if message == MessageCode.DISCHARGE_ATTEMPTED:
+			if not discharged_attempted:
+				self.mark_carrier_attempted(carrier_num)
+
+		elif message == MessageCode.DISCHARGED_AT_DESTINATION:
+			self.mark_carrier_delivered(carrier_num)
+
+		elif message == MessageCode.DISCHARGE_FAILED:
+			self.mark_carrier_failed(carrier_num)
+
+		elif message == MessageCode.DISCHARGE_ABORTED_DESTINATION_FULL:
+			self.mark_carrier_aborted(carrier_num)
+
+		else:
+			self.mark_carrier_unknown(carrier_num)
+
+	# ------------------------ chute location helper ------------------------
 
 	def _get_chute_location(self, assigned_name=None, assigned_mode=None):
 		issue_info = self.issue_info or {}
@@ -2200,6 +2151,22 @@ class Level_2_OrderRouting(
 
 			return None
 
+		# If PRE mode and vendor_name is None, route to NOVENDOR chute before
+		# attempting any other match. A missing vendor means we have no basis
+		# for a vendor-based sort, so NOVENDOR is the correct destination.
+		if assigned_mode == 'PRE':
+			vendor_name = issue_info.get('vendor_name')
+			if vendor_name is None:
+				self.logger.info(
+					'PRE mode with no vendor_name for assigned_name=%s, routing to NOVENDOR'
+					% assigned_name
+				)
+				dest = _find_match('NOVENDOR')
+				if dest is not None:
+					return dest
+				# NOVENDOR chute not configured - fall through to normal matching
+				self.logger.warn('NOVENDOR chute not found, falling through to normal PRE routing')
+
 		dest = _find_match(assigned_name)
 		if dest is not None:
 			return dest
@@ -2226,48 +2193,5 @@ class Level_2_OrderRouting(
 
 		self._dest_update(chute_name, chute_updates={'transit_info': transit_info})
 		return chute_name
-
-	# -------------------------- verify handling ----------------------------
-
-	def handle_verify(self, sorter_data):
-		super(Level_2_OrderRouting, self).handle_verify(sorter_data)
-
-		raw_dest = sorter_data.destination
-		if not raw_dest:
-			return
-
-		chute_fields = raw_dest.split('-')
-		if len(chute_fields) < 5:
-			return
-
-		destination = 'DST-{station:04d}-{chute}-1-{side}'.format(
-			station=int(chute_fields[2]),
-			chute=chute_fields[3],
-			side=chute_fields[4]
-		)
-
-		carrier_num = sorter_data.carrier_number
-
-		self.issue_info = self.get_carrier_issue(carrier_num) or {}
-		self.logger.info('%s:%s' % (carrier_num, self.issue_info))
-
-		message = sorter_data.message_code
-		self.logger.info('%s:%s....type:%s' % (sorter_data.message_code, message, type(message)))
-		rec = self.carrier_get(carrier_num)
-		discharged_attempted = rec.get('discharged_attempted', False) if rec else False
-
-		if message == MessageCode.DISCHARGE_ATTEMPTED:
-			if not discharged_attempted:
-				self.mark_carrier_attempted(carrier_num)
-
-		elif message == MessageCode.DISCHARGED_AT_DESTINATION:
-			self.mark_carrier_delivered(carrier_num)
-
-		elif message == MessageCode.DISCHARGE_FAILED:
-			self.mark_carrier_failed(carrier_num)
-
-		elif message == MessageCode.DISCHARGE_ABORTED_DESTINATION_FULL:
-			self.mark_carrier_aborted(carrier_num)
-
-		else:
-			self.mark_carrier_unknown(carrier_num)
+		
+		
