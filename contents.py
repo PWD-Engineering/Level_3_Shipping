@@ -43,7 +43,6 @@ COMMON_CHUTE_DEFAULT = {
 	'ofs': False,
 	'first_item_delivered_ts': None,
 
-
 	# sorter-specific payload lives here
 	'chute_info': {},
 
@@ -68,12 +67,11 @@ LEVEL2_CHUTE_DEFAULT = {
 	'inspection': False,
 	'size_mode': None,
 	'assigned': False,
-	'assigned_name': '',
+	'assigned_name': [],
 	'assigned_mode': '',
 	'has_upper_lower': True,
 	'has_front_rear': False,
 	'has_gate': True,
-
 	'transit_info': {},
 }
 
@@ -92,7 +90,6 @@ LEVEL3_CHUTE_DEFAULT = {
 	'has_upper_lower': True,
 	'has_front_rear': True,
 	'has_gate': False,
-
 }
 
 LEVEL3_SHIP_CHUTE_DEFAULT = {
@@ -110,7 +107,6 @@ LEVEL3_SHIP_CHUTE_DEFAULT = {
 	'has_upper_lower': True,
 	'has_front_rear': True,
 	'has_gate': True,
-
 }
 
 
@@ -227,7 +223,6 @@ class Destination(object):
 	LOOKUP_PROPERTIES = ['station', 'chute', 'dest', 'side']
 
 	def __init__(self, station, chute, dest=None, side=None, **context):
-		# allow 3-arg calling style: (station, chute, side)
 		if side is None and dest is not None:
 			side = dest
 			dest = None
@@ -675,9 +670,6 @@ class EuroSorterContentTracking(
 			'dfs': rec_dict.get('dfs', base['dfs']),
 			'ofs': rec_dict.get('ofs', base['ofs']),
 			'first_item_delivered_ts': rec_dict.get('first_item_delivered_ts', base['first_item_delivered_ts']),
-			'has_upper_lower': rec_dict.get('has_upper_lower', base['has_upper_lower']),
-			'has_front_rear': rec_dict.get('has_front_rear', base['has_front_rear']),
-			'has_gate': rec_dict.get('has_gate', base['has_gate']),
 			'enroute': rec_dict.get('enroute', base['enroute']),
 			'enqueue': rec_dict.get('enqueue', base['enqueue']),
 			'delivered': rec_dict.get('delivered', base['delivered']),
@@ -696,7 +688,6 @@ class EuroSorterContentTracking(
 				'faulted', 'in_service', 'enabled', 'position', 'chute_type',
 				'lane', 'occupied', 'available', 'dfs', 'ofs',
 				'first_item_delivered_ts',
-				'has_upper_lower', 'has_front_rear', 'has_gate',
 				'enroute', 'enqueue', 'delivered', 'last_updated'
 			):
 				continue
@@ -800,7 +791,7 @@ class EuroSorterContentTracking(
 
 		if mode == 'level2':
 			if not bool(chute_info.get('assigned')):
-				chute_info['assigned_name'] = ''
+				chute_info['assigned_name'] = []
 
 		elif mode == 'level3':
 			if new_record.get('occupied') is False:
@@ -869,7 +860,7 @@ class EuroSorterContentTracking(
 		return self.destination_update(
 			dest_key,
 			assigned=False,
-			assigned_name='',
+			assigned_name=[],
 			assigned_mode='',
 		)
 
@@ -1121,12 +1112,19 @@ class EuroSorterContentTracking(
 		dest_updates['enqueue'] = new_enqueue
 
 		if transit_info:
-			chute_info = {}
 			existing_ci = dest_rec.get('chute_info') or {}
-			if isinstance(existing_ci, dict):
-				chute_info.update(existing_ci)
+			if not isinstance(existing_ci, dict):
+				existing_ci = {}
 
-			current_transit = chute_info.get('transit_info', {}) or {}
+			caller_ci = dest_updates.get('chute_info') or {}
+			if not isinstance(caller_ci, dict):
+				caller_ci = {}
+
+			merged_ci = {}
+			merged_ci.update(existing_ci)
+			merged_ci.update(caller_ci)
+
+			current_transit = merged_ci.get('transit_info', {}) or {}
 			if not isinstance(current_transit, dict):
 				try:
 					current_transit = dict(current_transit)
@@ -1134,8 +1132,8 @@ class EuroSorterContentTracking(
 					current_transit = {}
 
 			current_transit.update(transit_info)
-			chute_info['transit_info'] = current_transit
-			dest_updates['chute_info'] = chute_info
+			merged_ci['transit_info'] = current_transit
+			dest_updates['chute_info'] = merged_ci
 
 		return self.update_carrier_and_destination(
 			carrier_number,
@@ -1181,7 +1179,7 @@ class EuroSorterContentTracking(
 		current_delivered = rec_carrier.get('delivered', 0) or 0
 		carrier_updates = dict(extra_carrier_updates or {})
 		carrier_updates['delivered'] = current_delivered + 1
-		carrier_updates['discharged_attempted'] = True
+		carrier_updates['discharged_attempted'] = False
 		carrier_updates['assigned_name'] = None
 		carrier_updates['assigned_mode'] = None
 
@@ -1220,7 +1218,7 @@ class EuroSorterContentTracking(
 		current_failed = rec_carrier.get('failed_deliveries', 0) or 0
 		carrier_updates = dict(extra_carrier_updates or {})
 		carrier_updates['failed_deliveries'] = current_failed + 1
-		carrier_updates['discharged_attempted'] = True
+		carrier_updates['discharged_attempted'] = False
 
 		dest_updates = None
 		if dest_identifier:
@@ -1250,7 +1248,7 @@ class EuroSorterContentTracking(
 		current_aborted = rec_carrier.get('deliveries_aborted', 0) or 0
 		carrier_updates = dict(extra_carrier_updates or {})
 		carrier_updates['deliveries_aborted'] = current_aborted + 1
-		carrier_updates['discharged_attempted'] = True
+		carrier_updates['discharged_attempted'] = False
 
 		dest_updates = None
 		if dest_identifier:
@@ -1288,7 +1286,7 @@ class EuroSorterContentTracking(
 
 		carrier_updates = dict(extra_carrier_updates or {})
 		carrier_updates.setdefault('issue_info', issue_info)
-		carrier_updates['discharged_attempted'] = True
+		carrier_updates['discharged_attempted'] = False
 
 		dest_updates = None
 		if dest_identifier:
