@@ -2200,13 +2200,47 @@ class Level_2_OrderRouting(
 # ===========================================================================
 	
 
+# ---------------------------------------------------------------------------
+# Permissive tag path prefixes — relative to:
+#   [EuroSort]EuroSort/Level3_Ship/Control/
+# ---------------------------------------------------------------------------
 _OB      = 'OB/'
 _PACKOUT = 'Packout/'
 _PURGE   = 'Purge/'
 _AGING   = 'OrderAging/'
 _DIMS    = 'Dims/'
 
+# ---------------------------------------------------------------------------
+# Chute types that accept consolidation items
+# ---------------------------------------------------------------------------
+CONSOLIDATION_CHUTE_TYPES = frozenset(['NORMAL', 'HP'])
 
+# ---------------------------------------------------------------------------
+# Carrier flipper lockout
+#
+# Physical constraint: after a carrier is diverted to a station, the flipper
+# needs 4 carriers to pass before it can switch to a DIFFERENT position at
+# the same station (different chute or different side).
+#
+# Same station + SAME position (chute+side)      -> always OK, flipper set
+# Same station + DIFFERENT position (chute|side) -> gap must be >= 4
+#
+# Example: carriers 1, 2, 3 go to station 1 lower-A.
+#   Carrier 4 -> station 1 upper-A  BLOCKED  (gap = 1)
+#   Carrier 5 -> station 1 upper-A  BLOCKED  (gap = 2)
+#   Carrier 6 -> station 1 upper-A  BLOCKED  (gap = 3)
+#   Carrier 7 -> station 1 upper-A  OK       (gap = 4)
+#   Carrier 7 -> station 1 lower-B  OK       (gap = 4, different side same chute)
+# ---------------------------------------------------------------------------
+CARRIER_FLIPPER_LOCKOUT = 4
+
+# Order statuses that are no longer active
+INVALID_ORDER_STATUSES = frozenset(['cancelled', 'shipped'])
+
+
+# ===========================================================================
+# LEVEL 3 SHIP
+# ===========================================================================
 
 class Level_3_Ship_OrderRouting(
 	EuroSorterContentTracking,
@@ -2215,43 +2249,45 @@ class Level_3_Ship_OrderRouting(
 	EuroSorterAccessWCS,
 	EuroSorterLightControl,
 ):
-	
+	"""
+	Routing class for the Level3_Ship EuroSort sorter.
+
+	Permissives:  [EuroSort]EuroSort/Level3_Ship/Control/
+	Destinations: [EuroSort]EuroSort/Level3_Ship/Destinations/
+
+	Flipper lockout
+	  Physical constraint — 4-carrier gap required before switching to a
+	  different position (chute or side) at the same station. Same position
+	  is always safe. Tracked in _station_carrier_log keyed by station int.
+	"""
+
+	STATION_CARRIER_CACHE_SCOPE = 'EuroSort-L3Ship-StationCarrier'
 
 	CONTROL_PERMISSIVE_TAG_MAPPING = {
-		# Flat control tags
-		'max_noread_recirc':   'noread recirc attempts',
-		'max_resort_recirc':   'excessive recirc attempts',
-		'squelch_wcs_updates': 'Squelch WCS',
-		'reset_dict':          'clear_defaults',
-		'reload_state':        'Reload Routes',
+		'max_noread_recirc':               'noread recirc attempts',
+		'max_resort_recirc':               'excessive recirc attempts',
+		'squelch_wcs_updates':             'Squelch WCS',
+		'reset_dict':                      'clear_defaults',
+		'reload_state':                    'Reload Routes',
 
-		# OB folder
-		'ob_configuration':    _OB + 'ob_configuration',
-		'ob_chute_limit':      _OB + 'ob_chute_limit',
+		'ob_configuration':                _OB + 'ob_configuration',
+		'ob_chute_limit':                  _OB + 'ob_chute_limit',
 
-		# Packout folder
-		'packout_configuration':          _PACKOUT + 'packout_configuration',
-		'tray_utilization_threshold_pct': _PACKOUT + 'tray_utilization_threshold_pct',
-		'chute_utilization_threshold_pct':_PACKOUT + 'chute_utilization_threshold_pct',
-		'reset_utilization_diff':         _PACKOUT + 'reset_utilization_diff',
-		'rear_chute_active':              _PACKOUT + 'rear_chute_active',
-		'routing_to_ob_active':           _PACKOUT + 'routing_to_ob_active',
-		'inspection_active':              _PACKOUT + 'inspection_active',
+		'packout_configuration':           _PACKOUT + 'packout_configuration',
+		'tray_utilization_threshold_pct':  _PACKOUT + 'tray_utilization_threshold_pct',
+		'chute_utilization_threshold_pct': _PACKOUT + 'chute_utilization_threshold_pct',
+		'reset_utilization_diff':          _PACKOUT + 'reset_utilization_diff',
+		'rear_chute_active':               _PACKOUT + 'rear_chute_active',
+		'routing_to_ob_active':            _PACKOUT + 'routing_to_ob_active',
+		'inspection_active':               _PACKOUT + 'inspection_active',
 
-		# Purge folder
-		'purge_active':          _PURGE + 'purge_active',
-		'purge_reset_to_normal': _PURGE + 'purge_reset_to_normal',
+		'purge_active':                    _PURGE + 'purge_active',
+		'purge_reset_to_normal':           _PURGE + 'purge_reset_to_normal',
 
-		# Order aging folder
-		'order_aging': _AGING + 'order_aging',
-
-		# Dims folder
-		'bag_dims': _DIMS + 'bag/dims',
+		'order_aging':                     _AGING + 'order_aging',
+		'bag_dims':                        _DIMS + 'bag/dims',
 	}
 
-	# Tags read from each destination UDT instance for status polling.
-	# Paths are relative to:
-	#   [EuroSort]EuroSort/Level3_Ship/Destinations/{dest_key}/Destination/
 	DEST_STATUS_TAGS = {
 		'in_service': 'In_Service',
 		'faulted':    'Faulted',
@@ -2263,12 +2299,9 @@ class Level_3_Ship_OrderRouting(
 	def __init__(self, name, **init_cfg):
 		super(Level_3_Ship_OrderRouting, self).__init__(name, **init_cfg)
 
-		self.logger = Logger(name)
+		self.logger         = Logger(name)
 		self.DEST_BASE_PATH = '[EuroSort]EuroSort/%s/Destinations' % name
-
-		self._last_check_utilization = system.date.now()
-
-		self.scanner_id = None
+		self.scanner_id     = None
 
 		for perm, tag in self.CONTROL_PERMISSIVE_TAG_MAPPING.items():
 			self._subscribe_control_permissive(perm, tag)
@@ -2282,7 +2315,7 @@ class Level_3_Ship_OrderRouting(
 			self.clear_all_destinations()
 
 	# ------------------------------------------------------------------
-	# Helpers
+	# Small helpers
 	# ------------------------------------------------------------------
 
 	def _gp(self, name, default=None):
@@ -2305,26 +2338,103 @@ class Level_3_Ship_OrderRouting(
 				pass
 
 	def _control_tag_path(self, tag_name):
-		"""Full path for a tag under the Control folder."""
 		return '[EuroSort]EuroSort/%s/Control/%s' % (self.name, tag_name)
 
 	def _write_permissive(self, perm_name, value):
-		"""Write back to a permissive tag by its mapped path."""
 		tag_suffix = self.CONTROL_PERMISSIVE_TAG_MAPPING.get(perm_name)
 		if not tag_suffix:
 			return
 		self._safe_tag_write(self._control_tag_path(tag_suffix), value)
+
+	def _dest_is_eligible(self, rec):
+		"""True if a destination record is in a routable state."""
+		if rec is None:
+			return False
+		if not rec.get('in_service', True):
+			return False
+		if rec.get('faulted', False):
+			return False
+		if self._dest_get(rec, 'dfs', False):
+			return False
+		if self._dest_get(rec, 'ofs', False):
+			return False
+		return True
+
+	def _is_noread(self, ibn):
+		return str(ibn or '').lower() in ('noread', 'noscan', 'nocode', '')
+
+	# ------------------------------------------------------------------
+	# Station carrier flipper lockout
+	# ------------------------------------------------------------------
+
+	@property
+	def _station_carrier_log(self):
+		"""
+		Dict: station_int -> {'carrier': int, 'chute': str, 'side': str}
+		Tracks the last carrier assigned at each station so the flipper
+		lockout can be enforced when a different position is requested.
+		"""
+		try:
+			return ExtraGlobal.access(self.name, self.STATION_CARRIER_CACHE_SCOPE)
+		except KeyError:
+			log = {}
+			ExtraGlobal.stash(log, self.name, self.STATION_CARRIER_CACHE_SCOPE,
+			                  lifespan=60 * 60 * 24)
+			return log
+
+	def _record_station_carrier(self, dest_key, carrier_number):
+		"""
+		Records that carrier_number was assigned to dest_key.
+		Called inside _find_consolidation_chute after a successful assignment.
+		"""
+		parts = str(dest_key).split('-')
+		if len(parts) != 5:
+			return
+		_, station, chute, _dest, side = parts
+		self._station_carrier_log[int(station)] = {
+			'carrier': int(carrier_number),
+			'chute':   chute,
+			'side':    side,
+		}
+
+	def _is_station_safe_for_carrier(self, dest_key, carrier_number):
+		"""
+		Returns True if carrier_number can be assigned to dest_key without
+		violating the 4-carrier flipper lockout.
+
+		Logic:
+		  - No prior assignment at this station         -> OK
+		  - Same chute AND same side as last assignment -> OK (flipper already set)
+		  - Different chute OR different side           -> need gap >= 4
+		"""
+		parts = str(dest_key).split('-')
+		if len(parts) != 5:
+			return True
+
+		_, station, chute, _dest, side = parts
+		station_int = int(station)
+
+		log = self._station_carrier_log.get(station_int)
+		if not log:
+			return True
+
+		last_carrier = int(log.get('carrier', 0))
+		last_chute   = str(log.get('chute', ''))
+		last_side    = str(log.get('side',  ''))
+
+		# Same position on the plane — flipper is already set, always safe
+		if chute == last_chute and side == last_side:
+			return True
+
+		# Different chute or different side — enforce 4-carrier gap
+		gap = int(carrier_number) - last_carrier
+		return gap >= CARRIER_FLIPPER_LOCKOUT
 
 	# ------------------------------------------------------------------
 	# Destination clear
 	# ------------------------------------------------------------------
 
 	def clear_all_destinations(self):
-		"""
-		Resets all Level3_Ship chute state to cleared defaults.
-		Uses clear_level3_ship_occupancy() so all fields are
-		correctly zeroed (sort_codes, rear_drop_*, priority flags, etc.).
-		"""
 		try:
 			self._initialize_destination_contents(full_clear=True)
 			self.logger.info('Reinitialized destination contents for %s' % self.name)
@@ -2339,6 +2449,11 @@ class Level_3_Ship_OrderRouting(
 			except Exception as e:
 				self.logger.warn('Failed clearing destination %s: %s' % (dest_key, str(e)))
 
+		try:
+			ExtraGlobal.trash(self.name, self.STATION_CARRIER_CACHE_SCOPE)
+		except KeyError:
+			pass
+
 		self.logger.info('clear_all_destinations: reset %d chutes' % updated)
 		return {'ok': True, 'data': {'updated': updated}, 'message': None}
 
@@ -2347,36 +2462,25 @@ class Level_3_Ship_OrderRouting(
 	# ------------------------------------------------------------------
 
 	def _destination_status_tagpaths(self, dest_key):
-		"""
-		Returns a dict of field_name -> full tag path for a given destination.
-		Reads from the UDT instance tags created by create_level3_ship.
-		"""
 		base   = self.DEST_BASE_PATH
 		prefix = '%s/%s/Destination' % (base, dest_key)
-		paths  = {}
-		for field_name, tag_name in self.DEST_STATUS_TAGS.items():
-			paths[field_name] = '%s/%s' % (prefix, tag_name)
-		return paths
+		return {
+			fn: '%s/%s' % (prefix, tag)
+			for fn, tag in self.DEST_STATUS_TAGS.items()
+		}
 
 	def _refresh_destination_status_from_tags(self):
-		"""
-		Periodic — reads In_Service, Faulted, DFS, OFS from each destination
-		UDT and syncs back into the contents cache. Fires on every poll cycle.
-		"""
+		"""Periodic — syncs In_Service, Faulted, DFS, OFS from UDT tags into cache."""
 		try:
 			all_dest = list(self.destinations_all_transit_info().keys())
 		except Exception:
 			return
-
 		if not all_dest:
 			return
 
-		read_paths = []
-		meta = []
-
+		read_paths, meta = [], []
 		for dest_key in all_dest:
-			tagpaths = self._destination_status_tagpaths(dest_key)
-			for field_name, path in tagpaths.items():
+			for field_name, path in self._destination_status_tagpaths(dest_key).items():
 				if field_name == 'status':
 					continue
 				read_paths.append(path)
@@ -2386,24 +2490,19 @@ class Level_3_Ship_OrderRouting(
 			return
 
 		results = system.tag.readBlocking(read_paths)
-
 		updates_by_dest = {}
 		for (dest_key, field_name), r in zip(meta, results):
 			try:
 				q = getattr(r, 'quality', None)
 				if q is not None and not q.isGood():
 					continue
-				value = bool(r.value)
+				updates_by_dest.setdefault(dest_key, {})[field_name] = bool(r.value)
 			except Exception:
 				continue
 
-			updates_by_dest.setdefault(dest_key, {})[field_name] = value
-
 		for dest_key, updates in updates_by_dest.items():
 			current = self.destination_get(dest_key) or {}
-			common_updates = {}
-			chute_updates  = {}
-
+			common_updates, chute_updates = {}, {}
 			for k, v in updates.items():
 				if k in ('dfs', 'ofs'):
 					if self._dest_get(current, k) != v:
@@ -2411,7 +2510,6 @@ class Level_3_Ship_OrderRouting(
 				else:
 					if current.get(k) != v:
 						common_updates[k] = v
-
 			if common_updates or chute_updates:
 				self._dest_update(dest_key, common_updates, chute_updates)
 
@@ -2421,107 +2519,752 @@ class Level_3_Ship_OrderRouting(
 
 	def _check_utilization_thresholds(self):
 		"""
-		Periodic — evaluates both utilization thresholds once per poll cycle
-		and updates rear_chute_active and routing_to_ob_active accordingly.
+		Periodic — evaluates both thresholds each poll cycle with hysteresis.
 
-		rear_chute_active:
-		  - ON  when front_utilization_pct > chute_utilization_threshold_pct
-		  - OFF when front_utilization_pct < (threshold - reset_utilization_diff)
+		rear_chute_active (UC9.7):
+		  ON  when front_pct > chute_utilization_threshold_pct
+		  OFF when front_pct < (threshold - reset_utilization_diff)
 
-		routing_to_ob_active:
-		  - ON  when carrier_usage_percent() > tray_utilization_threshold_pct
-		  - OFF when carrier_usage_percent() < (threshold - reset_utilization_diff)
-
-		Hysteresis (reset_utilization_diff) prevents rapid toggling at the
-		threshold boundary.
+		routing_to_ob_active (UC1.2):
+		  ON  when carrier_pct > tray_utilization_threshold_pct
+		  OFF when carrier_pct < (threshold - reset_utilization_diff)
 		"""
 		reset_diff = float(self._gp('reset_utilization_diff', 10.0) or 10.0)
 
-		# ── rear_chute_active ─────────────────────────────────────────
+		# rear_chute_active
 		chute_threshold = float(self._gp('chute_utilization_threshold_pct', 80.0) or 80.0)
-		chute_reset_at  = chute_threshold - reset_diff
+		front_pct       = self._front_chute_utilization_pct()
+		rear_active     = bool(self._gp('rear_chute_active', False))
 
-		front_pct = self._front_chute_utilization_pct()
-		current_rear_active = bool(self._gp('rear_chute_active', False))
-
-		if not current_rear_active and front_pct > chute_threshold:
-			self.logger.info(
-				'rear_chute_active ON — front utilization %.1f%% > threshold %.1f%%'
-				% (front_pct, chute_threshold)
-			)
+		if not rear_active and front_pct > chute_threshold:
+			self.logger.info('rear_chute_active ON — front %.1f%% > %.1f%%' % (front_pct, chute_threshold))
 			self._write_permissive('rear_chute_active', True)
-
-		elif current_rear_active and front_pct < chute_reset_at:
-			self.logger.info(
-				'rear_chute_active OFF — front utilization %.1f%% < reset threshold %.1f%%'
-				% (front_pct, chute_reset_at)
-			)
+		elif rear_active and front_pct < (chute_threshold - reset_diff):
+			self.logger.info('rear_chute_active OFF — front %.1f%% < %.1f%%' % (front_pct, chute_threshold - reset_diff))
 			self._write_permissive('rear_chute_active', False)
 
-		# ── routing_to_ob_active ──────────────────────────────────────
+		# routing_to_ob_active
 		tray_threshold = float(self._gp('tray_utilization_threshold_pct', 75.0) or 75.0)
-		tray_reset_at  = tray_threshold - reset_diff
+		carrier_pct    = self.carrier_usage_percent()
+		ob_active      = bool(self._gp('routing_to_ob_active', False))
 
-		carrier_pct = self.carrier_usage_percent()
-		current_ob_active = bool(self._gp('routing_to_ob_active', False))
-
-		if not current_ob_active and carrier_pct > tray_threshold:
-			self.logger.info(
-				'routing_to_ob_active ON — carrier utilization %.1f%% > threshold %.1f%%'
-				% (carrier_pct, tray_threshold)
-			)
+		if not ob_active and carrier_pct > tray_threshold:
+			self.logger.info('routing_to_ob_active ON — carrier %.1f%% > %.1f%%' % (carrier_pct, tray_threshold))
 			self._write_permissive('routing_to_ob_active', True)
-
-		elif current_ob_active and carrier_pct < tray_reset_at:
-			self.logger.info(
-				'routing_to_ob_active OFF — carrier utilization %.1f%% < reset threshold %.1f%%'
-				% (carrier_pct, tray_reset_at)
-			)
+		elif ob_active and carrier_pct < (tray_threshold - reset_diff):
+			self.logger.info('routing_to_ob_active OFF — carrier %.1f%% < %.1f%%' % (carrier_pct, tray_threshold - reset_diff))
 			self._write_permissive('routing_to_ob_active', False)
 
 	def _front_chute_utilization_pct(self):
 		"""
-		Returns the percentage of FRONT pack-out positions that are currently
-		occupied, as a float 0.0–100.0.
-
-		Only counts NORMAL and HP chutes (has_front_rear=True).
-		OB / JACKPOT / BAGGING / PURGE / INSPECTION chutes are excluded.
+		% of FRONT pack-out positions (has_front_rear=True, in-service, non-faulted)
+		that are currently occupied. Used to gate rear_chute_active.
 		"""
-		total    = 0
-		occupied = 0
-
-		for dest_key, rec in self._destination_contents.items():
+		total = occupied = 0
+		for _key, rec in self._destination_contents.items():
 			if rec is None:
 				continue
-
 			chute_info = self._dest_info(rec)
-			chute_type = str(rec.get('chute_type', 'NORMAL')).upper()
-
-			# Only count chutes that physically have a front/rear split
 			if not chute_info.get('has_front_rear', rec.get('has_front_rear', False)):
 				continue
-
-			# Only count front positions (dest digit == 2)
 			if rec.get('position') != 'FRONT':
 				continue
-
-			# Only in-service, non-faulted chutes count toward capacity
 			if not rec.get('in_service', True):
 				continue
 			if rec.get('faulted', False):
 				continue
-
 			total += 1
 			if bool(rec.get('occupied', False)):
 				occupied += 1
-
 		if total == 0:
 			return 0.0
 		return round((occupied / float(total)) * 100.0, 2)
 
-	
+	# ==================================================================
+	# route_destination
+	# ==================================================================
+
 	def route_destination(self, carrier_number, ibn, wcs_data=None):
-		raise NotImplementedError('Gil — route_destination (UC1)')
+		"""
+		UC1 — Main entry point. Called on every induction scan.
+
+		Sequence:
+		  1. Purge active     -> _route_purge (Bryor)
+		  2. NoRead barcode   -> _route_noread
+		  3. Carrier already has a valid assignment -> return it
+		  4. Resolve IBN via get_l3ship_ibn_info aggregation
+		  5. No valid zone/order -> jackpot
+		  6. hold_inspect + inspection_active -> INSPECTION chute
+		  7. MST/MSQ status -> _route_high_priority
+		  8. Normal consolidation -> _route_order
+		  9. No consolidation chute available -> _route_ob_check
+		"""
+		carrier_number = int(carrier_number)
+
+		# 1. Purge
+		if self._is_purge_active():
+			return self._route_purge(carrier_number)
+
+		# 2. NoRead
+		if self._is_noread(ibn):
+			return self._route_noread(carrier_number, ibn)
+
+		# 3. Existing valid destination
+		existing = self._get_existing_carrier_destination(carrier_number)
+		if existing:
+			return existing
+
+		# 4. Resolve IBN from WCS
+		ibn_info = self.get_l3ship_ibn_info(ibn)
+
+		if not ibn_info:
+			self.logger.info('route_destination: no valid zone/order for ibn=%s — jackpot' % ibn)
+			self.log_event('Routing', reason='No WCS match for ibn=%s' % ibn, ibn=ibn, code=100)
+			return self._get_jackpot_dest(carrier_number)
+
+		# Stash on carrier so handle_verify can access without re-querying
+		self.carrier_update(
+			carrier_number,
+			issue_info    = ibn_info,
+			assigned_name = ibn_info.get('order_number'),
+			assigned_mode = 'L3SHIP',
+			track_id      = ibn_info.get('ibn'),
+		)
+
+		order_status = str(ibn_info.get('status', '')).lower()
+
+		# 5. Inspection (UC9.10)
+		if bool(ibn_info.get('hold_inspect', False)) and bool(self._gp('inspection_active', False)):
+			dest = self._route_inspection(carrier_number, ibn_info)
+			if dest:
+				return dest
+
+		# 6. High priority (UC9.4)
+		if order_status in ('mst', 'msq'):
+			dest = self._route_high_priority(carrier_number, ibn_info)
+			if dest:
+				return dest
+
+		# 7. Normal consolidation
+		dest = self._route_order(carrier_number, ibn_info)
+		if dest:
+			return dest
+
+		# 8. No consolidation chute — check OB eligibility
+		return self._route_ob_check(carrier_number, ibn_info)
+
+	def _get_existing_carrier_destination(self, carrier_number):
+		"""
+		Returns the carrier's current destination if it is still valid
+		(in-service, not faulted, not DFS/OFS). Clears it if invalid.
+		"""
+		rec = self.carrier_get(carrier_number)
+		if not rec:
+			return None
+		dest = rec.get('destination')
+		if not dest:
+			return None
+		dest_rec = self.destination_get(dest)
+		if self._dest_is_eligible(dest_rec):
+			return dest
+		# Destination no longer valid — clear so we re-route
+		self.carrier_update(carrier_number, destination=None)
+		return None
+
+	def _get_jackpot_dest(self, carrier_number):
+		"""Returns the first available JACKPOT chute dest_key, or None."""
+		for dest_key, rec in self._destination_contents.items():
+			if rec is None:
+				continue
+			chute_type = str(rec.get('chute_type', '')).upper()
+			if chute_type not in ('JACKPOT', 'NOREAD'):
+				continue
+			if not self._dest_is_eligible(rec):
+				continue
+			return dest_key
+		self.logger.warn('_get_jackpot_dest: no JACKPOT chute available for carrier %s' % carrier_number)
+		return None
+
+	# ==================================================================
+	# _route_order
+	# ==================================================================
+
+	def _route_order(self, carrier_number, ibn_info):
+		"""
+		UC1.1 — Finds a consolidation chute for the given order and assigns
+		the carrier to it.
+
+		Returns dest_key string or None if no valid chute is available.
+		"""
+		order_number = ibn_info.get('order_number')
+		ibns         = ibn_info.get('ibns') or []
+		expected     = int(ibn_info.get('expected_count', 0))
+
+		dest = self._find_consolidation_chute(ibn_info, carrier_number=carrier_number)
+
+		if not dest:
+			self.log_event('Routing',
+				reason='No consolidation chute for order=%s ibn=%s' % (order_number, ibn_info.get('ibn')),
+				ibn=ibn_info.get('ibn'), code=5,
+			)
+			return None
+
+		# Assign carrier -> destination
+		self.assign_carrier_to_destination(
+			carrier_number  = carrier_number,
+			dest_identifier = dest,
+			assigned_name   = order_number,
+			assigned_mode   = 'L3SHIP',
+			transit_info    = ibn_info,
+		)
+
+		# Record station assignment for flipper lockout
+		self._record_station_carrier(dest, carrier_number)
+
+		# Set expected_line_count on the chute if not already set
+		dest_rec = self.destination_get(dest) or {}
+		chute_info = dest_rec.get('chute_info') or {}
+		if int(chute_info.get('expected_line_count', 0) or 0) == 0 and expected:
+			self.destination_update(dest, expected_line_count=expected, missing_ibns=ibns)
+
+		# Notify WCS — EuroSort gets rear chute name via sorter divert;
+		# WCS gets the front chute name via move-notify with IBN
+		self.notify_wcs_l3ship_item_inducted(ibn_info.get('ibn'), dest)
+
+		self.log_event('Routing',
+			reason='Assigned ibn=%s order=%s to %s' % (ibn_info.get('ibn'), order_number, dest),
+			ibn=ibn_info.get('ibn'), destination=dest, code=4,
+		)
+
+		return dest
+
+	# ==================================================================
+	# _find_consolidation_chute
+	# ==================================================================
+
+	def _find_consolidation_chute(self, ibn_info, carrier_number=None, exclude=None):
+		"""
+
+		Finds the best available consolidation chute for the given order.
+
+		Rules applied in order:
+		  UC9.2 — A chute may not contain two orders with the same sort code
+		  UC9.1 — Position must be below max_orders_per_position
+		  UC9.7 — Rear positions only allowed when rear_chute_active is True
+		           AND the front position of that chute is fully consolidated
+		  UC9.3 — Path of least travel (lowest station number first)
+		  Flipper lockout — different position at same station requires 4-carrier gap
+
+		SHARED INTERFACE: Charles calls this from _ob_release_assign_all_orders.
+		Signature must remain (ibn_info, carrier_number=None, exclude=None).
+
+		Args:
+			ibn_info:       dict from get_l3ship_ibn_info (contains order_number, sort_codes via subzone)
+			carrier_number: int — required for lockout check; None skips lockout
+			exclude:        set of dest_keys to skip (used by OB release to avoid re-assigning
+			                to the same chutes in the same release cycle)
+
+		Returns:
+			dest_key string of the best available position, or None.
+		"""
+		order_number = ibn_info.get('order_number')
+		# Sort code is the consol_subzone string — UC9.2 enforcement
+		sort_code    = str(ibn_info.get('consol_subzone', ''))
+
+		packout_cfg         = self._gp('packout_configuration') or {}
+		max_orders          = int(packout_cfg.get('max_order_count', 2) or 2)
+		rear_active         = bool(self._gp('rear_chute_active', False))
+		exclude             = exclude or set()
+
+		best_front = None   # best FRONT position found so far
+		best_rear  = None   # best REAR  position found so far
+
+		# UC9.3 — iterate destinations sorted by station (path of least travel)
+		for dest_key in self._sorted_destinations():
+			if dest_key in exclude:
+				continue
+
+			rec = self.destination_get(dest_key)
+			if rec is None:
+				continue
+
+			# Only NORMAL and HP chutes accept consolidation items
+			chute_type = str(rec.get('chute_type', '')).upper()
+			if chute_type not in CONSOLIDATION_CHUTE_TYPES:
+				continue
+
+			if not self._dest_is_eligible(rec):
+				continue
+
+			chute_info = rec.get('chute_info') or {}
+			position   = rec.get('position')   # 'FRONT' or 'REAR'
+
+			# UC9.7 — rear positions only when rear_chute_active is True
+			if position == 'REAR':
+				if not rear_active:
+					continue
+				# Rear can only be used if the front position of this chute
+				# is fully consolidated (has orders and all delivered)
+				front_key = self._front_key_for(dest_key)
+				if front_key:
+					front_rec  = self.destination_get(front_key) or {}
+					front_info = front_rec.get('chute_info') or {}
+					# Front must have orders assigned and be fully consolidated
+					if not bool(front_info.get('ready_for_packout', False)):
+						continue
+					if not front_rec.get('occupied', False):
+						continue
+
+			# UC9.2 — reject if this chute already has the same sort code
+			if sort_code and self.chute_has_sort_code(dest_key, sort_code):
+				continue
+
+			# Check if this chute already has this order (re-entry — OK, same chute)
+			existing_orders = chute_info.get('orders') or []
+			order_numbers   = [o.get('order_number') for o in existing_orders if isinstance(o, dict)]
+			if order_number in order_numbers:
+				# This order is already assigned here — same chute, safe to re-use
+				if position == 'FRONT':
+					return dest_key
+				if position == 'REAR' and rear_active:
+					return dest_key
+				continue
+
+			# UC9.1 — check max orders per position
+			order_count = len(existing_orders)
+			if order_count >= max_orders:
+				continue
+
+			# Flipper lockout — skip if carrier can't safely reach this position
+			if carrier_number is not None:
+				if not self._is_station_safe_for_carrier(dest_key, carrier_number):
+					continue
+
+			# Candidate passes all rules — prefer FRONT over REAR (UC9.7 default)
+			if position == 'FRONT' and best_front is None:
+				best_front = dest_key
+				break   # First valid FRONT in station order is the best (UC9.3)
+
+			if position == 'REAR' and best_rear is None:
+				best_rear = dest_key
+
+		# UC9.7 — front is default; rear only if no front is available
+		return best_front or best_rear
+
+	def _front_key_for(self, rear_dest_key):
+		"""
+		Given a REAR dest_key (dest digit == 1), returns the corresponding
+		FRONT dest_key (dest digit == 2) for the same physical chute.
+		Returns None if the dest_key cannot be parsed.
+		"""
+		parts = str(rear_dest_key).split('-')
+		if len(parts) != 5 or parts[3] != '1':
+			return None
+		_, station, chute, _dest, side = parts
+		return 'DST-%s-%s-2-%s' % (station, chute, side)
+
+	# ==================================================================
+	# _route_high_priority
+	# ==================================================================
+
+	def _route_high_priority(self, carrier_number, ibn_info):
+		"""
+		UC9.4 — Diverts to the nearest HP-configured chute.
+
+		Nearest = lowest station number with an available HP chute that
+		passes sort-code, max-orders, and flipper-lockout checks.
+		Falls through to None if no HP chute is available — caller then
+		falls back to normal consolidation routing.
+		"""
+		order_number = ibn_info.get('order_number')
+		sort_code    = str(ibn_info.get('consol_subzone', ''))
+		packout_cfg  = self._gp('packout_configuration') or {}
+		max_orders   = int(packout_cfg.get('max_order_count', 2) or 2)
+
+		for dest_key in self._sorted_destinations():
+			rec = self.destination_get(dest_key)
+			if rec is None:
+				continue
+
+			if str(rec.get('chute_type', '')).upper() != 'HP':
+				continue
+
+			if not self._dest_is_eligible(rec):
+				continue
+
+			if rec.get('position') != 'FRONT':
+				continue
+
+			chute_info = rec.get('chute_info') or {}
+
+			if sort_code and self.chute_has_sort_code(dest_key, sort_code):
+				continue
+
+			if len(chute_info.get('orders') or []) >= max_orders:
+				continue
+
+			if carrier_number is not None:
+				if not self._is_station_safe_for_carrier(dest_key, carrier_number):
+					continue
+
+			self.assign_carrier_to_destination(
+				carrier_number  = carrier_number,
+				dest_identifier = dest_key,
+				assigned_name   = order_number,
+				assigned_mode   = 'L3SHIP-HP',
+				transit_info    = ibn_info,
+			)
+			self._record_station_carrier(dest_key, carrier_number)
+			self.notify_wcs_l3ship_item_inducted(ibn_info.get('ibn'), dest_key)
+
+			self.log_event('Routing',
+				reason='HP route ibn=%s order=%s to %s' % (ibn_info.get('ibn'), order_number, dest_key),
+				ibn=ibn_info.get('ibn'), destination=dest_key, code=9,
+			)
+			return dest_key
+
+		return None
+
+	# ==================================================================
+	# _route_noread
+	# ==================================================================
+
+	def _route_noread(self, carrier_number, ibn):
+		"""
+		Handles NoRead barcodes.
+
+		Increments recirculation count. When max_noread_recirc is reached,
+		diverts to a JACKPOT chute and notifies WCS.
+
+		Returns jackpot dest_key if max reached, otherwise None (recirc).
+		"""
+		carrier_number = int(carrier_number)
+		rec            = self.carrier_get(carrier_number) or {}
+		recirc_count   = int(rec.get('recirculation_count', 0) or 0) + 1
+		max_count      = int(self._gp('max_noread_recirc', 0) or 0)
+
+		self.carrier_update(carrier_number, recirculation_count=recirc_count)
+
+		self.logger.info('_route_noread carrier=%s recirc=%s max=%s' % (carrier_number, recirc_count, max_count))
+
+		if max_count > 0 and recirc_count >= max_count:
+			dest = self._get_jackpot_dest(carrier_number)
+			if dest:
+				self.assign_carrier_to_destination(
+					carrier_number  = carrier_number,
+					dest_identifier = dest,
+					assigned_name   = 'JACKPOT',
+					assigned_mode   = 'NOREAD',
+					transit_info    = {'ibn': str(ibn), 'reason': 'noread_max_recirc'},
+				)
+				self.notify_wcs_l3ship_jackpot_divert(str(ibn), None, dest)
+				self.log_event('Routing',
+					reason='NoRead max recirc ibn=%s to %s' % (ibn, dest),
+					ibn=str(ibn), destination=dest, code=10,
+				)
+				return dest
+
+		return None
+
+	# ==================================================================
+	# _route_ob_check
+	# ==================================================================
+
+	def _route_ob_check(self, carrier_number, ibn_info):
+		"""
+		Decides whether to send an item to an OB chute.
+
+		Two conditions must BOTH be true to divert to OB:
+		  1. routing_to_ob_active is True (carrier utilization exceeded threshold)
+		  2. The carrier has not been re-inducted from OB (ob_reinducted == False)
+		     per UC5.6 — once re-inducted, the carrier must NEVER go to OB again
+
+		When routing_to_ob_active is False, recirc count is not enforced
+		unless it reaches the hard max_resort_recirc ceiling (_max_recirc).
+
+		Returns OB dest_key if diverted, or result of _max_recirc (jackpot or None).
+		"""
+		carrier_number = int(carrier_number)
+		rec            = self.carrier_get(carrier_number) or {}
+
+		ob_active     = bool(self._gp('routing_to_ob_active', False))
+		ob_reinducted = bool(rec.get('ob_reinducted', False))
+
+		if ob_active and not ob_reinducted:
+			dest = self._ob_select_chute()
+			if dest:
+				self.assign_carrier_to_destination(
+					carrier_number  = carrier_number,
+					dest_identifier = dest,
+					assigned_name   = ibn_info.get('order_number'),
+					assigned_mode   = 'OB',
+					transit_info    = ibn_info,
+				)
+				self.notify_wcs_l3ship_ob_divert(
+					ibn           = ibn_info.get('ibn'),
+					from_dest_key = None,
+					ob_dest_key   = dest,
+				)
+				self.log_event('Routing',
+					reason='OB divert ibn=%s to %s' % (ibn_info.get('ibn'), dest),
+					ibn=ibn_info.get('ibn'), destination=dest, code=6,
+				)
+				return dest
+
+		# No OB available or not eligible — check hard recirc ceiling
+		return self._max_recirc(carrier_number, ibn_info)
+
+	# ==================================================================
+	# _max_recirc
+	# ==================================================================
+
+	def _max_recirc(self, carrier_number, ibn_info):
+		"""
+		Hard recirculation limit enforcement.
+
+		When routing_to_ob_active is False, items may recirc freely until
+		they hit this ceiling. When reached, item is forced to JACKPOT
+		regardless of routing_to_ob_active state.
+
+		Returns jackpot dest_key if ceiling reached, otherwise None (recirc).
+		"""
+		carrier_number = int(carrier_number)
+		rec            = self.carrier_get(carrier_number) or {}
+		recirc_count   = int(rec.get('recirculation_count', 0) or 0) + 1
+		max_recirc     = int(self._gp('max_resort_recirc', 0) or 0)
+
+		self.carrier_update(carrier_number, recirculation_count=recirc_count)
+
+		self.logger.info('_max_recirc carrier=%s recirc=%s max=%s' % (carrier_number, recirc_count, max_recirc))
+
+		if max_recirc > 0 and recirc_count >= max_recirc:
+			ibn  = ibn_info.get('ibn', '')
+			dest = self._get_jackpot_dest(carrier_number)
+			if dest:
+				self.assign_carrier_to_destination(
+					carrier_number  = carrier_number,
+					dest_identifier = dest,
+					assigned_name   = 'JACKPOT',
+					assigned_mode   = 'MAX_RECIRC',
+					transit_info    = ibn_info,
+				)
+				self.notify_wcs_l3ship_jackpot_divert(ibn, None, dest)
+				self.log_event('Routing',
+					reason='Max recirc ibn=%s to jackpot %s' % (ibn, dest),
+					ibn=ibn, destination=dest, code=11,
+				)
+				return dest
+
+		return None
+
+	# ==================================================================
+	# UC9.10 — _route_inspection  (internal helper)
+	# ==================================================================
+
+	def _route_inspection(self, carrier_number, ibn_info):
+		"""
+		Routes a hold_inspect item to an INSPECTION chute.
+		Returns dest_key or None if no INSPECTION chute is available.
+		"""
+		order_number = ibn_info.get('order_number')
+		for dest_key in self._sorted_destinations():
+			rec = self.destination_get(dest_key)
+			if rec is None:
+				continue
+			if str(rec.get('chute_type', '')).upper() != 'INSPECTION':
+				continue
+			if not self._dest_is_eligible(rec):
+				continue
+			if carrier_number is not None:
+				if not self._is_station_safe_for_carrier(dest_key, carrier_number):
+					continue
+
+			self.assign_carrier_to_destination(
+				carrier_number  = carrier_number,
+				dest_identifier = dest_key,
+				assigned_name   = order_number,
+				assigned_mode   = 'INSPECTION',
+				transit_info    = ibn_info,
+			)
+			self._record_station_carrier(dest_key, carrier_number)
+			self.notify_wcs_l3ship_item_inducted(ibn_info.get('ibn'), dest_key)
+
+			self.log_event('Routing',
+				reason='Inspection route ibn=%s order=%s to %s' % (ibn_info.get('ibn'), order_number, dest_key),
+				ibn=ibn_info.get('ibn'), destination=dest_key, code=8,
+			)
+			return dest_key
+
+		return None
+
+	# ==================================================================
+	# handle_verify  (discharge message handler)
+	# ==================================================================
 
 	def handle_verify(self, carrier_number, dest_key, verify_data=None):
-		raise NotImplementedError('Gil — handle_verify (UC9)')
+		"""
+		UC9 — Called when EuroSort reports a discharge message for a carrier.
+
+		Handles MessageCode values and routes to the appropriate action:
+		  DISCHARGE_ATTEMPTED           -> mark_carrier_attempted
+		  DISCHARGED_AT_DESTINATION     -> _finalize_discharge + mark_carrier_delivered
+		  DISCHARGE_FAILED              -> mark_carrier_failed
+		  DISCHARGE_ABORTED_*           -> mark_carrier_aborted
+		  Everything else               -> mark_carrier_unknown
+
+		Args:
+			carrier_number: int or numeric string
+			dest_key:       dest_key the sorter discharged to
+			verify_data:    sorter_data object with message_code attribute
+		"""
+		carrier_number = int(carrier_number)
+		message_code   = getattr(verify_data, 'message_code', None) if verify_data else None
+
+		rec       = self.carrier_get(carrier_number) or {}
+		ibn_info  = rec.get('issue_info') or {}
+		ibn       = ibn_info.get('ibn', '')
+
+		self.log_event('Routing',
+			reason='handle_verify carrier=%s dest=%s code=%s' % (carrier_number, dest_key, message_code),
+			ibn=ibn, destination=dest_key, code=99,
+		)
+
+		if message_code == MessageCode.DISCHARGE_ATTEMPTED:
+			if not rec.get('discharged_attempted', False):
+				self.mark_carrier_attempted(carrier_number)
+
+		elif message_code == MessageCode.DISCHARGED_AT_DESTINATION:
+			self._finalize_discharge(carrier_number, dest_key, ibn_info)
+			self.mark_carrier_delivered(carrier_number)
+
+		elif message_code == MessageCode.DISCHARGE_FAILED:
+			self.mark_carrier_failed(carrier_number)
+
+		elif message_code in (
+			MessageCode.DISCHARGE_ABORTED_DESTINATION_FULL,
+			MessageCode.DISCHARGE_ABORTED_POSITIONING_ERROR,
+		):
+			# Increment recirc count on abort — the item is recirculating
+			recirc = int(rec.get('recirculation_count', 0) or 0) + 1
+			self.carrier_update(carrier_number, recirculation_count=recirc)
+			self.mark_carrier_aborted(carrier_number)
+
+		else:
+			self.mark_carrier_unknown(carrier_number)
+
+	# ==================================================================
+	# UC9.8 / UC9.9 — _finalize_discharge
+	# ==================================================================
+
+	def _finalize_discharge(self, carrier_number, dest_key, ibn_info=None):
+		"""
+		Steps:
+		  1. Add IBN to chute ibns list, remove from missing_ibns
+		  2. Update counts (item_count_total, line_count_total, percent_consolidated)
+		  3. Update oldest_order_age_sec from first_item_delivered_ts
+		  4. Evaluate ready_for_packout (UC9.9) — all expected IBNs delivered
+		  5. If ready_for_packout and rear_drop needed, set rear_drop_pending (UC9.8)
+		  6. Notify WCS
+
+		Args:
+			carrier_number: int
+			dest_key:       dest_key that was discharged
+			ibn_info:       dict from get_l3ship_ibn_info (ibn, order_number, ibns, expected_count)
+		"""
+		ibn_info      = ibn_info or {}
+		ibn           = str(ibn_info.get('ibn', ''))
+		order_number  = str(ibn_info.get('order_number', ''))
+		expected_ibns = ibn_info.get('ibns') or []
+		expected_cnt  = int(ibn_info.get('expected_count', 0) or 0)
+
+		dest_rec   = self.destination_get(dest_key) or {}
+		chute_info = dest_rec.get('chute_info') or {}
+
+		# ── 1. Update IBN tracking ────────────────────────────────────
+		current_ibns    = list(chute_info.get('ibns') or [])
+		missing_ibns    = list(chute_info.get('missing_ibns') or expected_ibns)
+		item_count      = int(chute_info.get('item_count_total', 0) or 0)
+		line_count      = int(chute_info.get('line_count_total', 0) or 0)
+
+		if ibn and ibn not in current_ibns:
+			current_ibns.append(ibn)
+			item_count += 1
+			line_count += 1
+
+		if ibn in missing_ibns:
+			missing_ibns.remove(ibn)
+
+		# ── 2. Percent consolidated ───────────────────────────────────
+		if expected_cnt > 0:
+			delivered_cnt = expected_cnt - len(missing_ibns)
+			pct           = round((delivered_cnt / float(expected_cnt)) * 100.0, 2)
+		else:
+			pct = 0.0
+
+		# ── 3. Age tracking ───────────────────────────────────────────
+		first_ts = dest_rec.get('first_item_delivered_ts')
+		if first_ts:
+			try:
+				age_sec = int(system.date.secondsBetween(first_ts, system.date.now()))
+			except Exception:
+				age_sec = 0
+		else:
+			age_sec = 0
+
+		# ── 4. ready_for_packout (UC9.9) ──────────────────────────────
+		ready = len(missing_ibns) == 0 and expected_cnt > 0
+
+		# ── 5. Rear drop pending (UC9.8) ──────────────────────────────
+		position         = dest_rec.get('position', '')
+		rear_drop_pending = False
+
+		if ready and position == 'REAR':
+			# All items in rear — set pending so the batch door raises
+			rear_drop_pending = True
+
+		# ── Write back ────────────────────────────────────────────────
+		self.destination_update(dest_key,
+			ibns                      = current_ibns,
+			missing_ibns              = missing_ibns,
+			item_count_total          = item_count,
+			line_count_total          = line_count,
+			percent_orders_consolidated = pct,
+			oldest_order_age_sec      = age_sec,
+			ready_for_packout         = ready,
+			rear_drop_pending         = rear_drop_pending,
+		)
+
+		# ── 6. WCS notifications ──────────────────────────────────────
+		if ready:
+			if position == 'REAR':
+				# Items ready in rear — notify WCS of rear-to-front state change
+				self.notify_wcs_l3ship_rear_to_front(order_number, dest_key)
+			else:
+				# Front consolidated — deliver-notify to WCS
+				self.notify_wcs_l3ship_packout_deliver(order_number, dest_key)
+
+		self.log_event('Routing',
+			reason='_finalize_discharge dest=%s ibn=%s ready=%s pct=%.1f' % (dest_key, ibn, ready, pct),
+			ibn=ibn, destination=dest_key, code=8,
+		)
+
+	
+	def _ob_select_chute(self):
+		"""
+		UC4.1 / UC4.2 — Selects the next OB chute using waterfall method
+		(highest station to lowest, stopping at ob_chute_limit).
+		Charles implements.
+		"""
+		raise NotImplementedError('Charles — _ob_select_chute (UC4.1, UC4.2)')
+
+	def ob_release(self, dest_key):
+		"""UC5.1 / UC5.3 — Charles implements."""
+		raise NotImplementedError('Charles — ob_release (UC5.1, UC5.3)')
+
+	def _is_purge_active(self):
+		"""Returns True if the system is in purge state (UC12.1)."""
+		return bool(self._gp('purge_active', False))
+
+	def _route_purge(self, carrier_number):
+		"""UC12.2 / UC12.3 — Bryor implements."""
+		raise NotImplementedError('Bryor — _route_purge (UC12.2, UC12.3)')
