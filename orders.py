@@ -1009,12 +1009,14 @@ class Level_2_OrderRouting(
 		updated = 0
 		ts = system.date.now()
 
+		# Re-initialize destination contents via the proper contents.py API.
+		# The old ExtraGlobal[cache_key] = {} pattern bypassed stash/trash and
+		# had no effect with the current implementation.
 		try:
-			cache_key = "SORTER_DESTINATIONS_%s" % self.name
-			ExtraGlobal[cache_key] = {}
-			self.logger.info("Cleared ExtraGlobal cache key: %s" % cache_key)
-		except Exception as e:  # FIX #4
-			self.logger.warn("Failed clearing ExtraGlobal destination cache: %s" % str(e))
+			self._initialize_destination_contents(full_clear=True)
+			self.logger.info("Reinitialized destination contents cache for %s" % self.name)
+		except Exception as e:
+			self.logger.warn("Failed reinitializing destination contents cache: %s" % str(e))
 
 		try:
 			destination_names = list(self.destinations_all_transit_info().keys())
@@ -1029,7 +1031,6 @@ class Level_2_OrderRouting(
 					common_updates={
 						'enroute': 0,
 						'delivered': 0,
-						'enqueue': 0,
 						'last_updated': ts,
 					},
 					chute_updates={
@@ -1522,7 +1523,7 @@ class Level_2_OrderRouting(
 				self.carrier_update(
 					carrier_num,
 					discharged_attempted=False,
-					destination=''
+					destination=None
 				)
 
 			if destination:
