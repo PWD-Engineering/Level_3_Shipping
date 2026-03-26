@@ -1248,6 +1248,161 @@ class EuroSorterContentTracking(
 		"""Returns only carriers that have been created (i.e. seen at least once). Not all carrier_max."""
 		return self._carrier_contents
 
+	def carrier_usage_percent(self):
+		"""
+		Returns the percentage of the sorter's carrier capacity that is currently
+		active (i.e. has a destination assigned), as a float 0.0–100.0.
+
+		Based on CARRIERS_MAX, not the number of carriers seen — this gives a
+		true utilisation figure against the physical tray count.
+
+		Returns:
+			float — e.g. 42.7 means 42.7% of trays are carrying an item
+		"""
+		active = sum(
+			1 for rec in self._carrier_contents.values()
+			if self._carrier_is_active(rec)
+		)
+		if not self.CARRIERS_MAX:
+			return 0.0
+		return round((active / float(self.CARRIERS_MAX)) * 100.0, 2)
+
+	def purge_active_carriers(self, jackpot_dest_key):
+		"""
+		Emergency purge of all carriers that are currently active but have not
+		been delivered. For each such carrier:
+		  1. Reads the track_id so the WCS can divert the physical tray.
+		  2. Updates the carrier's destination to the given jackpot_dest_key.
+		  3. Writes the change through to Mongo via carrier_update.
+
+		The caller is responsible for sending the actual WCS divert command using
+		the returned track_ids. This method only updates the logical state.
+
+		Args:
+			jackpot_dest_key: dest_key string of the target JACKPOT chute
+			                  (must have chute_type == 'JACKPOT' or 'NOREAD')
+
+		Returns:
+			list of dicts: [{'carrier_number': int, 'track_id': str|None,
+			                 'previous_destination': str|None}, ...]
+			One entry per carrier that was diverted.
+		"""
+		diverted = []
+
+		for num, rec in list(self._carrier_contents.items()):
+			if not self._carrier_is_active(rec):
+				continue
+
+			track_id = rec.get('track_id')
+			previous_dest = rec.get('destination')
+
+			self.carrier_update(num, destination=jackpot_dest_key)
+
+			diverted.append({
+				'carrier_number': num,
+				'track_id':            track_id,
+				'previous_destination': previous_dest,
+			})
+
+		self.logger.warn(
+			'purge_active_carriers: diverted {n} carriers to {dest} for sorter {name}',
+			n=len(diverted), dest=jackpot_dest_key, name=self.name,
+		)
+		self.log_event('tracking', reason='purge-active-carriers', count=len(diverted))
+
+		return diverted
+
+	def reset_carrier_metrics(self, carrier_number):
+		"""
+		Resets all lifetime metric counters on a carrier record back to zero
+		without removing the record from Mongo. Use this for per-carrier
+		maintenance (e.g. end-of-day or after a carrier swap).
+
+		Resets: delivered, failed_deliveries, deliveries_aborted, recirculation_count.
+		Does NOT reset: ob_reinducted, destination, track_id, or any active state.
+
+		Args:
+			carrier_number: int or numeric string
+
+		Returns:
+			updated carrier record
+		"""
+		num = self._coerce_carrier_number(carrier_number)
+		return self.carrier_update(
+			num,
+			delivered=0,
+			failed_deliveries=0,
+			deliveries_aborted=0,
+			recirculation_count=0,
+		)
+
+	def reset_all_carrier_metrics(self):
+		"""
+		Resets lifetime metric counters for every carrier that has a Mongo record.
+		Loads all carriers from Mongo (including idle ones not in cache), resets
+		their metrics, and writes them back. Active carriers in cache are also
+		updated immediately.
+
+		Use at end-of-day or after a physical tray swap-out.
+
+		Returns:
+			int — number of carrier records reset
+		"""
+		count = 0
+
+		# Reset any active carriers currently in cache
+		for num in list(self._carrier_contents.keys()):
+			self.carrier_update(
+				num,
+				delivered=0,
+				failed_deliveries=0,
+				deliveries_aborted=0,
+				recirculation_count=0,
+			)
+			count += 1
+
+		# Also reset idle carriers sitting in Mongo (not in cache)
+		try:
+			status, doc = self._load_sorter_doc()
+			if status:
+				mongo_carriers = doc.get('carriers') or {}
+				changed = False
+				for num_str, rec_dict in mongo_carriers.items():
+					if not isinstance(rec_dict, dict):
+						continue
+					try:
+						num = int(num_str)
+					except Exception:
+						continue
+					# Skip if already handled via cache above
+					if num in self._carrier_contents:
+						continue
+					rec_dict['delivered'] = 0
+					rec_dict['failed_deliveries'] = 0
+					rec_dict['deliveries_aborted'] = 0
+					rec_dict['recirculation_count'] = 0
+					rec_dict['last_updated'] = system.date.now()
+					mongo_carriers[num_str] = rec_dict
+					count += 1
+					changed = True
+
+				if changed:
+					doc['carriers'] = mongo_carriers
+					doc['last_updated'] = system.date.now()
+					upsert_record(MONGODB, MONGO_COLL, doc, {'_id': self.name})
+		except Exception as e:
+			self.logger.warn(
+				'reset_all_carrier_metrics: failed to reset Mongo-only carriers for {name}: {err}',
+				name=self.name, err=e,
+			)
+
+		self.logger.warn(
+			'reset_all_carrier_metrics: reset {n} carrier records for sorter {name}',
+			n=count, name=self.name,
+		)
+		self.log_event('tracking', reason='reset-carrier-metrics', count=count)
+		return count
+
 	def carrier_get(self, carrier_number):
 		"""
 		Returns the carrier record for carrier_number, or None if this carrier
