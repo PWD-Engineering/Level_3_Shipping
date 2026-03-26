@@ -2358,6 +2358,7 @@ class Level_3_Ship_OrderRouting(
 			return False
 		if self._dest_get(rec, 'ofs', False):
 			return False
+			
 		return True
 
 	def _is_noread(self, ibn):
@@ -2748,12 +2749,20 @@ class Level_3_Ship_OrderRouting(
 		Finds the best available consolidation chute for the given order.
 
 		Rules applied in order:
-		  UC9.2 — A chute may not contain two orders with the same sort code
-		  UC9.1 — Position must be below max_orders_per_position
-		  UC9.7 — Rear positions only allowed when rear_chute_active is True
+			Chute in_service
+			Chute not OB
+			Chute not Bagging
+			Chute not Jackpot
+			Chute not DFS
+			Chute not OFS
+			Chute not Faulted
+			UC9.2 — A chute may not contain two orders with the same sort code
+		  	UC9.1 — Position must be below max_orders_per_position
+			UC9.7 — Rear positions only allowed when rear_chute_active is True
 		           AND the front position of that chute is fully consolidated
-		  UC9.3 — Path of least travel (lowest station number first)
-		  Flipper lockout — different position at same station requires 4-carrier gap
+			UC9.3 — Path of least travel (lowest station number first)
+  			Flipper lockout — different position at same station requires 4-carrier gap
+		  
 
 		SHARED INTERFACE: Charles calls this from _ob_release_assign_all_orders.
 		Signature must remain (ibn_info, carrier_number=None, exclude=None).
