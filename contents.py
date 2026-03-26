@@ -35,7 +35,7 @@ COMMON_CHUTE_DEFAULT = {
 	'faulted': False,
 	'in_service': True,
 	'position': None,                # FRONT | REAR | None
-	'chute_type': 'NORMAL',          # NORMAL | PACKOUT | HP | JACKPOT | INSPECTION | NOREAD | BAGGING | PURGE
+	'chute_type': 'NORMAL',          # NORMAL | PACKOUT | HP | JACKPOT | INSPECTION | NOREAD | BAGGING | PURGE | OB
 	'lane': 0,
 	'occupied': False,
 	'available': True,
@@ -48,7 +48,6 @@ COMMON_CHUTE_DEFAULT = {
 
 	# common tracking / metrics
 	'enroute': 0,
-	'enqueue': 0,
 	'delivered': 0,
 	'last_updated': None,
 }
@@ -92,40 +91,42 @@ LEVEL3_CHUTE_DEFAULT = {
 	'has_gate': False,
 }
 
+
+
 LEVEL3_SHIP_CHUTE_DEFAULT = {
-	'ready_for_packout': False,
-	'missing_ibns': [],
-	'expected_line_count': 0,
+
+	# [ALL] Order and IBN content
+	'orders': [],       # order dicts assigned to this chute/position
+	'ibns': [],         # IBN strings physically present
+
+	'sort_codes': [],
+
 	'order_count_total': 0,
 	'item_count_total': 0,
 	'line_count_total': 0,
+	'expected_line_count': 0,            # total lines expected across all assigned orders
+	'missing_ibns': [],                  # IBNs assigned but not yet physically discharged
 	'percent_orders_consolidated': 0.0,
+
 	'oldest_order_age_sec': 0,
 
-	# FIX #2: corrected idle/cleared state per UC9.8 — batch door is DOWN at rest,
-	# only raised when utilization threshold is exceeded
-	'batch_door_state': 'DOWN',      # UP | DOWN | UNKNOWN
+	'contains_priority_order': False,
 
-	# FIX #7: rear drop state fields belong in the default schema so they are
-	# always present and don't appear only after a clear operation
+	# UC9.9 — set True by _finalize_discharge when all items for all orders in this
+	# position are consolidated. Triggers the position light via WCS.
+	'ready_for_packout': False,
+
+	# UC9.8 — batch door state. DOWN at rest; only raised when utilization threshold exceeded.
+	# OB chutes (UC2.1) have no batch door — present but must not be read/written for chute_type == 'OB'.
+	'batch_door_state': 'DOWN',          # DOWN | UP | UNKNOWN
+
+	# UC9.8 — rear drop sequencing. Same OB caveat as batch_door_state.
 	'rear_drop_pending': False,
 	'rear_drop_complete': False,
 
-	'orders': [],
-	'ibns': [],
-
-	# FIX #1: sort_codes needed to enforce UC9.2 — only one order per sort code
-	# per chute. Must be tracked as a first-class field to avoid iterating orders[].
-	'sort_codes': [],
-
-	# FIX #4: priority escalation flag per UC10.3 — if any order in this chute
-	# escalates to high priority while already consolidated here, this flag is set
-	# and the chute UI changes to red with a flashing light
-	'contains_priority_order': False,
-
 	'has_upper_lower': True,
-	'has_front_rear': True,
-	'has_gate': True,
+	'has_front_rear': True,             # False for OB/JACKPOT/NOREAD/PURGE/INSPECTION/BAGGING
+	'has_gate': True,                   # False for same set
 }
 
 
@@ -151,7 +152,6 @@ SORTER_CONFIG = {
 			'oversized':     'oversized',
 			'size_mode':     'size_mode',
 			'enroute':       'enroute',
-			'enqueue':       'enqueue',
 			'delivered':     'delivered',
 		},
 	},
@@ -182,30 +182,26 @@ SORTER_CONFIG = {
 			'volume_percent_full':    'volume_percent_full',
 			'chuteCount':             'chuteCount',
 			'enroute':                'enroute',
-			'enqueue':                'enqueue',
 			'delivered':              'delivered',
 		},
 	},
 	'Level3_Ship': {
 		'aliases': ('Level3_Ship', 'level3_ship', 'LEVEL3_SHIP', 'Level3Ship', 'level3ship'),
-		# FIX #6: TODO — confirm final carrier count with EuroSort. The spec's
-		# outstanding questions note the location count is unresolved (possibly
-		# 1,504 positions counting batch doors across 94 packs x 8 chutes).
-		# 999 is a placeholder until that is confirmed.
-		'carrier_max': 999,
 		'wcs_prefix': 'D',
 		'mode': 'level3_ship',
 		'chute_default': LEVEL3_SHIP_CHUTE_DEFAULT,
 		'tag_field_map': {
 			'in_service':                  'in_service',
 			'faulted':                     'faulted',
-			'chute_type':                  'chute_type',
+			'chute_type':                  'chute_type',     # UI needs this to tell OB from consolidation
 			'lane':                        'lane',
 			'occupied':                    'occupied',
 			'available':                   'available',
 			'dfs':                         'dfs',
 			'ofs':                         'ofs',
 			'first_item_delivered_ts':     'first_item_delivered_ts',
+			'has_front_rear':              'has_front_rear', # written so UI can read without calling Python
+			'has_gate':                    'has_gate',
 			'ready_for_packout':           'ready_for_packout',
 			'missing_ibns':                'missing_ibns',
 			'expected_line_count':         'expected_line_count',
@@ -222,11 +218,25 @@ SORTER_CONFIG = {
 			'orders':                      'orders',
 			'ibns':                        'ibns',
 			'enroute':                     'enroute',
-			'enqueue':                     'enqueue',
 			'delivered':                   'delivered',
 		},
 	},
 }
+
+
+# ---------------------------------------------------------------------------
+# Operator-selectable vs system-assigned chute types (UC8.1)
+# set_chute_type() (Andrew) must reject system-assigned types.
+# ---------------------------------------------------------------------------
+OPERATOR_SELECTABLE_CHUTE_TYPES = frozenset([
+	'NORMAL', 'HP', 'JACKPOT', 'INSPECTION', 'PURGE',
+])
+
+SYSTEM_ASSIGNED_CHUTE_TYPES = frozenset([
+	'NOREAD',   # system alias for JACKPOT behavior
+	'BAGGING',  # re-induction lane, set by destination mapping
+	'OB',       # overflow buffer, set by destination mapping
+])
 
 
 class Chutes(Enum):
@@ -491,15 +501,20 @@ class EuroSorterContentTracking(
 
 	def _apply_physical_behavior_defaults(self, new_record):
 		"""
-		FIX #5: Apply physical behavior flags per chute type. Previously all
-		non-BAGGING chutes received has_front_rear=True and has_gate=True, which
-		is incorrect for JACKPOT, NOREAD, HP, INSPECTION, and PURGE chutes that
-		do not have batch doors. Each type is now handled explicitly per the
-		spec (UC8.1).
+		Sets has_upper_lower, has_front_rear, and has_gate from chute_type.
+		Called automatically by destination_update() and _init_destination().
+		Never call this manually — it runs on every update.
 		"""
 		chute_type = str(new_record.get('chute_type', 'NORMAL')).strip().upper()
 
-		if chute_type == 'BAGGING':
+		if chute_type == 'OB':
+			# UC2.1 — single level deep, no batch door, no front/rear.
+			# Holds multiple orders (UC3.1) in one undivided space.
+			new_record['has_upper_lower'] = True
+			new_record['has_front_rear']  = False
+			new_record['has_gate']        = False
+
+		elif chute_type == 'BAGGING':
 			# Bagging re-induction lane — single pass, no front/rear, no gate
 			new_record['has_upper_lower'] = False
 			new_record['has_front_rear'] = False
@@ -778,7 +793,6 @@ class EuroSorterContentTracking(
 			'ofs': rec_dict.get('ofs', base['ofs']),
 			'first_item_delivered_ts': rec_dict.get('first_item_delivered_ts', base['first_item_delivered_ts']),
 			'enroute': rec_dict.get('enroute', base['enroute']),
-			'enqueue': rec_dict.get('enqueue', base['enqueue']),
 			'delivered': rec_dict.get('delivered', base['delivered']),
 			'last_updated': rec_dict.get('last_updated', base['last_updated']),
 		})
@@ -795,7 +809,7 @@ class EuroSorterContentTracking(
 				'faulted', 'in_service', 'enabled', 'position', 'chute_type',
 				'lane', 'occupied', 'available', 'dfs', 'ofs',
 				'first_item_delivered_ts',
-				'enroute', 'enqueue', 'delivered', 'last_updated'
+				'enroute', 'delivered', 'last_updated'
 			):
 				continue
 			if k == 'chute_info':
@@ -991,12 +1005,6 @@ class EuroSorterContentTracking(
 	def clear_level3_ship_occupancy(self, dest_key):
 		if self._get_sorter_mode() != 'level3_ship':
 			return None
-		# FIX #2: batch_door_state corrected to 'DOWN' — per UC9.8 the batch door
-		# is down at rest and only raised when the utilization threshold is exceeded.
-		# FIX #7: rear_drop_pending and rear_drop_complete are now defined in the
-		# default schema, so they are safe to reset here without surprise.
-		# FIX #1: sort_codes reset to empty list so UC9.2 enforcement starts clean.
-		# FIX #4: contains_priority_order reset to False on occupancy clear.
 		return self.destination_update(
 			dest_key,
 			occupied=False,
@@ -1011,8 +1019,6 @@ class EuroSorterContentTracking(
 			percent_orders_consolidated=0.0,
 			oldest_order_age_sec=0,
 			batch_door_state='DOWN',
-			rear_drop_pending=False,
-			rear_drop_complete=False,
 			sort_codes=[],
 			contains_priority_order=False,
 			orders=[],
@@ -1092,6 +1098,29 @@ class EuroSorterContentTracking(
 		return self.destination_update(dest_key, contains_priority_order=False)
 
 	# ------------------------------------------------------------------
+	# LEVEL3_SHIP CHUTE TYPE GUARD (UC8.1)
+	# ------------------------------------------------------------------
+	def _assert_operator_chute_type(self, chute_type):
+		"""
+		Raises ValueError if chute_type is not in OPERATOR_SELECTABLE_CHUTE_TYPES.
+		Used by Andrew's set_chute_type() to prevent OB, NOREAD, and BAGGING
+		from being set via the UI (UC8.1).
+		"""
+		ct = str(chute_type).strip().upper()
+		if ct not in OPERATOR_SELECTABLE_CHUTE_TYPES:
+			if ct in SYSTEM_ASSIGNED_CHUTE_TYPES:
+				raise ValueError(
+					'chute_type %r is system-assigned and cannot be set by an operator. '
+					'Operator-selectable types: %s'
+					% (chute_type, ', '.join(sorted(OPERATOR_SELECTABLE_CHUTE_TYPES)))
+				)
+			raise ValueError(
+				'Unknown chute_type %r. Operator-selectable types: %s'
+				% (chute_type, ', '.join(sorted(OPERATOR_SELECTABLE_CHUTE_TYPES)))
+			)
+		return ct
+
+	# ------------------------------------------------------------------
 	# CARRIER CONTENTS (ExtraGlobal)
 	# ------------------------------------------------------------------
 	@property
@@ -1128,14 +1157,14 @@ class EuroSorterContentTracking(
 		if not self.CARRIERS_MAX:
 			raise ValueError('carrier_max not configured for sorter %s' % self.name)
 
-		for carrier_num in range(self.CARRIERS_MIN, self.CARRIERS_MAX + 1):
-			if carrier_num not in carrier_contents:
-				carrier_contents[carrier_num] = self._init_carrier(carrier_num)
-
+		# Carriers are created on first use — no pre-population.
+		# On restart, only rehydrate carriers that were actively carrying an item
+		# (destination != None). Idle carriers are not worth restoring.
 		try:
 			status, doc = self._load_sorter_doc()
 			mongo_carriers = doc.get('carriers')
 			if mongo_carriers:
+				skipped = 0
 				for num_str, rec_dict in mongo_carriers.items():
 					if not isinstance(rec_dict, dict):
 						continue
@@ -1147,6 +1176,9 @@ class EuroSorterContentTracking(
 						continue
 					base = self._init_carrier(num)
 					base.update(rec_dict)
+					if not self._carrier_is_active(base):
+						skipped += 1
+						continue
 					carrier_contents[num] = base
 		except Exception as e:
 			self.logger.warn(
@@ -1156,8 +1188,10 @@ class EuroSorterContentTracking(
 			)
 
 		self.logger.trace(
-			'Initialized/verified carrier metadata for {n} carriers (with Mongo hydration)',
-			n=len(carrier_contents)
+			'Carrier store ready for sorter {name} — {n} active carriers restored from Mongo, {s} idle skipped (lazy init active)',
+			name=self.name,
+			n=len(carrier_contents),
+			s=skipped,
 		)
 
 	def _init_carrier(self, n):
@@ -1175,15 +1209,33 @@ class EuroSorterContentTracking(
 			'discharged_attempted': False,
 			'failed_deliveries': 0,
 			'deliveries_aborted': 0,
-			'unknown_deliveries': 0,
-			# FIX #3: UC5.6 requires that once an item is re-inducted from an OB
-			# chute it must NEVER divert to OB again. This flag makes that rule
-			# directly enforceable without having to infer it from other state.
 			'ob_reinducted': False,
 			'last_updated': None,
 		}
 
+	def _carrier_is_active(self, rec):
+		"""
+		Returns True if this carrier is currently carrying an item — i.e. it has
+		a destination assigned. Idle carriers (destination=None) are not kept in
+		cache and are not persisted to Mongo.
+		"""
+		if not isinstance(rec, dict):
+			return False
+		return rec.get('destination') is not None
+
+	def _evict_carrier(self, num):
+		"""
+		Removes a carrier from the in-memory cache once it is no longer active.
+		The Mongo record is intentionally kept — it holds lifetime metrics
+		(delivered, failed_deliveries, recirculation_count, etc.) that must
+		survive restarts. The carrier will be re-created in cache on next use.
+		"""
+		carriers = self._carrier_contents
+		if num in carriers:
+			del carriers[num]
+
 	def carriers_clear(self):
+		"""Drops all carrier records from cache and Mongo. Carriers will be re-created on next use."""
 		self.logger.warn('Clearing carriers cache for sorter {name}', name=self.name)
 		try:
 			ExtraGlobal.trash(self.name, self.CARRIERS_CACHE_SCOPE)
@@ -1193,9 +1245,17 @@ class EuroSorterContentTracking(
 		self._sync_all_to_mongo()
 
 	def carriers_all(self):
+		"""Returns only carriers that have been created (i.e. seen at least once). Not all carrier_max."""
 		return self._carrier_contents
 
 	def carrier_get(self, carrier_number):
+		"""
+		Returns the carrier record for carrier_number, or None if this carrier
+		has never been inducted. Callers must handle None — do not assume a
+		carrier record exists just because the number is in range.
+
+		Records are created on first write via carrier_update(), not on read.
+		"""
 		if not carrier_number:
 			return None
 		num = self._coerce_carrier_number(carrier_number)
@@ -1225,6 +1285,8 @@ class EuroSorterContentTracking(
 
 		record = carriers.get(num)
 		if record is None:
+			# First time this carrier has been seen — create it on demand.
+			self.logger.trace('Creating carrier record on first use: {num}', num=num)
 			record = self._init_carrier(num)
 
 		if not isinstance(record, dict):
@@ -1296,11 +1358,7 @@ class EuroSorterContentTracking(
 
 		dest_rec = self.destination_get(dest_identifier) or {}
 
-		current_enqueue = dest_rec.get('enqueue', 0) or 0
-		new_enqueue = current_enqueue + 1
-
 		dest_updates = dict(extra_dest_updates)
-		dest_updates['enqueue'] = new_enqueue
 
 		if transit_info:
 			existing_ci = dest_rec.get('chute_info') or {}
@@ -1344,20 +1402,6 @@ class EuroSorterContentTracking(
 		num = self._coerce_carrier_number(carrier_number)
 		return self.carrier_update(num, ob_reinducted=True)
 
-	def _decrement_destination_enqueue(self, dest_identifier):
-		if not dest_identifier:
-			return None
-
-		dest_rec = self.destination_get(dest_identifier)
-		if dest_rec is None:
-			return None
-
-		current_enqueue = dest_rec.get('enqueue', 0) or 0
-		new_enqueue = current_enqueue - 1
-		if new_enqueue < 0:
-			new_enqueue = 0
-
-		return self.destination_update(dest_identifier, {'enqueue': new_enqueue})
 
 	def mark_carrier_attempted(self, carrier_number, **extra_carrier_updates):
 		num = self._coerce_carrier_number(carrier_number)
@@ -1384,30 +1428,33 @@ class EuroSorterContentTracking(
 		carrier_updates['discharged_attempted'] = False
 		carrier_updates['assigned_name'] = None
 		carrier_updates['assigned_mode'] = None
+		# Clear destination so the carrier is no longer considered active.
+		# This is what gates both cache eviction and Mongo hydration on restart.
+		carrier_updates['destination'] = None
 
 		dest_updates = None
 		if dest_identifier:
 			dest_rec = self.destination_get(dest_identifier)
 			if dest_rec is not None:
 				dest_delivered = dest_rec.get('delivered', 0) or 0
-				dest_enqueue = dest_rec.get('enqueue', 0) or 0
-				new_enqueue = dest_enqueue - 1
-				if new_enqueue < 0:
-					new_enqueue = 0
 				dest_updates = {
 					'delivered': dest_delivered + 1,
-					'enqueue': new_enqueue,
 				}
 
 				if not dest_rec.get('first_item_delivered_ts'):
 					dest_updates['first_item_delivered_ts'] = system.date.now()
 
-		return self.update_carrier_and_destination(
+		# Write the final metrics to carrier record and destination, then flush to Mongo.
+		self.update_carrier_and_destination(
 			carrier_number=num,
 			dest_identifier=dest_identifier,
 			carrier_updates=carrier_updates,
 			dest_updates=dest_updates,
 		)
+
+		# Evict from cache — the carrier is now idle. Mongo retains the record
+		# for lifetime metrics (delivered count, recirculation_count, etc.).
+		self._evict_carrier(num)
 
 	def mark_carrier_failed(self, carrier_number, **extra_carrier_updates):
 		num = self._coerce_carrier_number(carrier_number)
@@ -1426,11 +1473,7 @@ class EuroSorterContentTracking(
 		if dest_identifier:
 			dest_rec = self.destination_get(dest_identifier)
 			if dest_rec is not None:
-				current_enqueue = dest_rec.get('enqueue', 0) or 0
-				new_enqueue = current_enqueue - 1
-				if new_enqueue < 0:
-					new_enqueue = 0
-				dest_updates = {'enqueue': new_enqueue}
+				dest_updates = {}
 
 		return self.update_carrier_and_destination(
 			carrier_number=num,
@@ -1456,11 +1499,7 @@ class EuroSorterContentTracking(
 		if dest_identifier:
 			dest_rec = self.destination_get(dest_identifier)
 			if dest_rec is not None:
-				current_enqueue = dest_rec.get('enqueue', 0) or 0
-				new_enqueue = current_enqueue - 1
-				if new_enqueue < 0:
-					new_enqueue = 0
-				dest_updates = {'enqueue': new_enqueue}
+				dest_updates = {}
 
 		return self.update_carrier_and_destination(
 			carrier_number=num,
@@ -1494,11 +1533,7 @@ class EuroSorterContentTracking(
 		if dest_identifier:
 			dest_rec = self.destination_get(dest_identifier)
 			if dest_rec is not None:
-				current_enqueue = dest_rec.get('enqueue', 0) or 0
-				new_enqueue = current_enqueue - 1
-				if new_enqueue < 0:
-					new_enqueue = 0
-				dest_updates = {'enqueue': new_enqueue}
+				dest_updates = {}
 
 		return self.update_carrier_and_destination(
 			carrier_number=num,
