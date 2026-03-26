@@ -2195,4 +2195,333 @@ class Level_2_OrderRouting(
 		self._dest_update(chute_name, chute_updates={'transit_info': transit_info})
 		return chute_name
 		
-		
+# ===========================================================================
+# LEVEL 3 SHIP
+# ===========================================================================
+	
+
+_OB      = 'OB/'
+_PACKOUT = 'Packout/'
+_PURGE   = 'Purge/'
+_AGING   = 'OrderAging/'
+_DIMS    = 'Dims/'
+
+
+
+class Level_3_Ship_OrderRouting(
+	EuroSorterContentTracking,
+	EuroSorterPermissivePolling,
+	EuroSorterPolling,
+	EuroSorterAccessWCS,
+	EuroSorterLightControl,
+):
+	
+
+	CONTROL_PERMISSIVE_TAG_MAPPING = {
+		# Flat control tags
+		'max_noread_recirc':   'noread recirc attempts',
+		'max_resort_recirc':   'excessive recirc attempts',
+		'squelch_wcs_updates': 'Squelch WCS',
+		'reset_dict':          'clear_defaults',
+		'reload_state':        'Reload Routes',
+
+		# OB folder
+		'ob_configuration':    _OB + 'ob_configuration',
+		'ob_chute_limit':      _OB + 'ob_chute_limit',
+
+		# Packout folder
+		'packout_configuration':          _PACKOUT + 'packout_configuration',
+		'tray_utilization_threshold_pct': _PACKOUT + 'tray_utilization_threshold_pct',
+		'chute_utilization_threshold_pct':_PACKOUT + 'chute_utilization_threshold_pct',
+		'reset_utilization_diff':         _PACKOUT + 'reset_utilization_diff',
+		'rear_chute_active':              _PACKOUT + 'rear_chute_active',
+		'routing_to_ob_active':           _PACKOUT + 'routing_to_ob_active',
+		'inspection_active':              _PACKOUT + 'inspection_active',
+
+		# Purge folder
+		'purge_active':          _PURGE + 'purge_active',
+		'purge_reset_to_normal': _PURGE + 'purge_reset_to_normal',
+
+		# Order aging folder
+		'order_aging': _AGING + 'order_aging',
+
+		# Dims folder
+		'bag_dims': _DIMS + 'bag/dims',
+	}
+
+	# Tags read from each destination UDT instance for status polling.
+	# Paths are relative to:
+	#   [EuroSort]EuroSort/Level3_Ship/Destinations/{dest_key}/Destination/
+	DEST_STATUS_TAGS = {
+		'in_service': 'In_Service',
+		'faulted':    'Faulted',
+		'dfs':        'DFS',
+		'ofs':        'OFS',
+		'status':     'Light/Status',
+	}
+
+	def __init__(self, name, **init_cfg):
+		super(Level_3_Ship_OrderRouting, self).__init__(name, **init_cfg)
+
+		self.logger = Logger(name)
+		self.DEST_BASE_PATH = '[EuroSort]EuroSort/%s/Destinations' % name
+
+		self._last_check_utilization = system.date.now()
+
+		self.scanner_id = None
+
+		for perm, tag in self.CONTROL_PERMISSIVE_TAG_MAPPING.items():
+			self._subscribe_control_permissive(perm, tag)
+
+		self._polling_methods.append(self._refresh_destination_status_from_tags)
+		self._polling_methods.append(self._check_utilization_thresholds)
+
+		self._init_polling()
+
+		if self._gp('reset_dict', False):
+			self.clear_all_destinations()
+
+	# ------------------------------------------------------------------
+	# Helpers
+	# ------------------------------------------------------------------
+
+	def _gp(self, name, default=None):
+		try:
+			return self.get_permissive(name)
+		except Exception:
+			return default
+
+	def _safe_tag_write(self, paths, values):
+		try:
+			if isinstance(paths, (str, unicode)):
+				paths = [paths]
+			if not isinstance(values, (list, tuple)):
+				values = [values]
+			system.tag.writeBlocking(paths, values)
+		except Exception as e:
+			try:
+				self.logger.error('Tag write failed for %s: %s' % (paths, e))
+			except Exception:
+				pass
+
+	def _control_tag_path(self, tag_name):
+		"""Full path for a tag under the Control folder."""
+		return '[EuroSort]EuroSort/%s/Control/%s' % (self.name, tag_name)
+
+	def _write_permissive(self, perm_name, value):
+		"""Write back to a permissive tag by its mapped path."""
+		tag_suffix = self.CONTROL_PERMISSIVE_TAG_MAPPING.get(perm_name)
+		if not tag_suffix:
+			return
+		self._safe_tag_write(self._control_tag_path(tag_suffix), value)
+
+	# ------------------------------------------------------------------
+	# Destination clear
+	# ------------------------------------------------------------------
+
+	def clear_all_destinations(self):
+		"""
+		Resets all Level3_Ship chute state to cleared defaults.
+		Uses clear_level3_ship_occupancy() so all fields are
+		correctly zeroed (sort_codes, rear_drop_*, priority flags, etc.).
+		"""
+		try:
+			self._initialize_destination_contents(full_clear=True)
+			self.logger.info('Reinitialized destination contents for %s' % self.name)
+		except Exception as e:
+			self.logger.warn('Failed reinitializing destination contents: %s' % str(e))
+
+		updated = 0
+		for dest_key in list(self.destinations_all_transit_info().keys()):
+			try:
+				self.clear_level3_ship_occupancy(dest_key)
+				updated += 1
+			except Exception as e:
+				self.logger.warn('Failed clearing destination %s: %s' % (dest_key, str(e)))
+
+		self.logger.info('clear_all_destinations: reset %d chutes' % updated)
+		return {'ok': True, 'data': {'updated': updated}, 'message': None}
+
+	# ------------------------------------------------------------------
+	# Destination status polling
+	# ------------------------------------------------------------------
+
+	def _destination_status_tagpaths(self, dest_key):
+		"""
+		Returns a dict of field_name -> full tag path for a given destination.
+		Reads from the UDT instance tags created by create_level3_ship.
+		"""
+		base   = self.DEST_BASE_PATH
+		prefix = '%s/%s/Destination' % (base, dest_key)
+		paths  = {}
+		for field_name, tag_name in self.DEST_STATUS_TAGS.items():
+			paths[field_name] = '%s/%s' % (prefix, tag_name)
+		return paths
+
+	def _refresh_destination_status_from_tags(self):
+		"""
+		Periodic — reads In_Service, Faulted, DFS, OFS from each destination
+		UDT and syncs back into the contents cache. Fires on every poll cycle.
+		"""
+		try:
+			all_dest = list(self.destinations_all_transit_info().keys())
+		except Exception:
+			return
+
+		if not all_dest:
+			return
+
+		read_paths = []
+		meta = []
+
+		for dest_key in all_dest:
+			tagpaths = self._destination_status_tagpaths(dest_key)
+			for field_name, path in tagpaths.items():
+				if field_name == 'status':
+					continue
+				read_paths.append(path)
+				meta.append((dest_key, field_name))
+
+		if not read_paths:
+			return
+
+		results = system.tag.readBlocking(read_paths)
+
+		updates_by_dest = {}
+		for (dest_key, field_name), r in zip(meta, results):
+			try:
+				q = getattr(r, 'quality', None)
+				if q is not None and not q.isGood():
+					continue
+				value = bool(r.value)
+			except Exception:
+				continue
+
+			updates_by_dest.setdefault(dest_key, {})[field_name] = value
+
+		for dest_key, updates in updates_by_dest.items():
+			current = self.destination_get(dest_key) or {}
+			common_updates = {}
+			chute_updates  = {}
+
+			for k, v in updates.items():
+				if k in ('dfs', 'ofs'):
+					if self._dest_get(current, k) != v:
+						chute_updates[k] = v
+				else:
+					if current.get(k) != v:
+						common_updates[k] = v
+
+			if common_updates or chute_updates:
+				self._dest_update(dest_key, common_updates, chute_updates)
+
+	# ------------------------------------------------------------------
+	# Utilization monitoring — rear_chute_active + routing_to_ob_active
+	# ------------------------------------------------------------------
+
+	def _check_utilization_thresholds(self):
+		"""
+		Periodic — evaluates both utilization thresholds once per poll cycle
+		and updates rear_chute_active and routing_to_ob_active accordingly.
+
+		rear_chute_active:
+		  - ON  when front_utilization_pct > chute_utilization_threshold_pct
+		  - OFF when front_utilization_pct < (threshold - reset_utilization_diff)
+
+		routing_to_ob_active:
+		  - ON  when carrier_usage_percent() > tray_utilization_threshold_pct
+		  - OFF when carrier_usage_percent() < (threshold - reset_utilization_diff)
+
+		Hysteresis (reset_utilization_diff) prevents rapid toggling at the
+		threshold boundary.
+		"""
+		reset_diff = float(self._gp('reset_utilization_diff', 10.0) or 10.0)
+
+		# ── rear_chute_active ─────────────────────────────────────────
+		chute_threshold = float(self._gp('chute_utilization_threshold_pct', 80.0) or 80.0)
+		chute_reset_at  = chute_threshold - reset_diff
+
+		front_pct = self._front_chute_utilization_pct()
+		current_rear_active = bool(self._gp('rear_chute_active', False))
+
+		if not current_rear_active and front_pct > chute_threshold:
+			self.logger.info(
+				'rear_chute_active ON — front utilization %.1f%% > threshold %.1f%%'
+				% (front_pct, chute_threshold)
+			)
+			self._write_permissive('rear_chute_active', True)
+
+		elif current_rear_active and front_pct < chute_reset_at:
+			self.logger.info(
+				'rear_chute_active OFF — front utilization %.1f%% < reset threshold %.1f%%'
+				% (front_pct, chute_reset_at)
+			)
+			self._write_permissive('rear_chute_active', False)
+
+		# ── routing_to_ob_active ──────────────────────────────────────
+		tray_threshold = float(self._gp('tray_utilization_threshold_pct', 75.0) or 75.0)
+		tray_reset_at  = tray_threshold - reset_diff
+
+		carrier_pct = self.carrier_usage_percent()
+		current_ob_active = bool(self._gp('routing_to_ob_active', False))
+
+		if not current_ob_active and carrier_pct > tray_threshold:
+			self.logger.info(
+				'routing_to_ob_active ON — carrier utilization %.1f%% > threshold %.1f%%'
+				% (carrier_pct, tray_threshold)
+			)
+			self._write_permissive('routing_to_ob_active', True)
+
+		elif current_ob_active and carrier_pct < tray_reset_at:
+			self.logger.info(
+				'routing_to_ob_active OFF — carrier utilization %.1f%% < reset threshold %.1f%%'
+				% (carrier_pct, tray_reset_at)
+			)
+			self._write_permissive('routing_to_ob_active', False)
+
+	def _front_chute_utilization_pct(self):
+		"""
+		Returns the percentage of FRONT pack-out positions that are currently
+		occupied, as a float 0.0–100.0.
+
+		Only counts NORMAL and HP chutes (has_front_rear=True).
+		OB / JACKPOT / BAGGING / PURGE / INSPECTION chutes are excluded.
+		"""
+		total    = 0
+		occupied = 0
+
+		for dest_key, rec in self._destination_contents.items():
+			if rec is None:
+				continue
+
+			chute_info = self._dest_info(rec)
+			chute_type = str(rec.get('chute_type', 'NORMAL')).upper()
+
+			# Only count chutes that physically have a front/rear split
+			if not chute_info.get('has_front_rear', rec.get('has_front_rear', False)):
+				continue
+
+			# Only count front positions (dest digit == 2)
+			if rec.get('position') != 'FRONT':
+				continue
+
+			# Only in-service, non-faulted chutes count toward capacity
+			if not rec.get('in_service', True):
+				continue
+			if rec.get('faulted', False):
+				continue
+
+			total += 1
+			if bool(rec.get('occupied', False)):
+				occupied += 1
+
+		if total == 0:
+			return 0.0
+		return round((occupied / float(total)) * 100.0, 2)
+
+	
+	def route_destination(self, carrier_number, ibn, wcs_data=None):
+		raise NotImplementedError('Gil — route_destination (UC1)')
+
+	def handle_verify(self, carrier_number, dest_key, verify_data=None):
+		raise NotImplementedError('Gil — handle_verify (UC9)')
