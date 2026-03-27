@@ -3257,6 +3257,10 @@ class Level_3_Ship_OrderRouting(
 			ibn=ibn, destination=dest_key, code=8,
 		)
 
+
+
+
+
 	
 	def _ob_select_chute(self):
 		"""
@@ -3269,6 +3273,47 @@ class Level_3_Ship_OrderRouting(
 	def ob_release(self, dest_key):
 		"""UC5.1 / UC5.3 — Charles implements."""
 		raise NotImplementedError('Charles — ob_release (UC5.1, UC5.3)')
+	
+	def _ob_is_full(self, dest_key):
+		"""UC4.3 Evaluate by item count or order count"""
+		raise NotImplementedError('Coming soon')
+	
+	def _ob_assign_order(self, dest_key, ibn_info):
+		"""UC3.1 Assign order to OB chute"""
+		raise NotImplementedError('Coming soon')
+
+	def _ob_release_assign_all_orders(self, dest_key):
+		"""UC5.4 Immediately assign all orders to consol chut on release"""
+		raise NotImplementedError('Coming soon')
+	
+	def _ob_clear_chute(self, dest_key):
+		"""UC5.5 Flag chute once cleared"""
+		raise NotImplementedError('Coming soon')
+	
+	def _ob_get_eligible_chutes(self):
+		"""UC5.2 Returns chutes eligible for release by age"""
+		raise NotImplementedError('Coming soon')
+	
+	def _ob_age_color_state(self, dest_key):
+		"""UC6.1 Compute gradient based on age"""
+		raise NotImplementedError('Coming soon')
+	
+	def _ob_chute_metrics(self, dest_key):
+		"""UC6.2 #Orders, %Order contained, #Lines, %Orders consoled, eligible for release"""
+		raise NotImplementedError('Coming soon')
+	
+	def _check_ob_age_updates(self):
+		"""UC6.1 Update age metrics on all active OB chutes"""
+		raise NotImplementedError('Coming soon')
+
+
+
+
+
+
+
+
+
 
 	def _is_purge_active(self):
 		"""Returns True if the system is in purge state (UC12.1)."""
